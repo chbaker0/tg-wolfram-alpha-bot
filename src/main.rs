@@ -28,7 +28,7 @@ async fn main() -> eyre::Result<()> {
     while let Some(u) = receiver.recv().await {
         let Some(msg) = &u.message else {continue};
         let Some(mut text) = msg.text.as_deref() else {continue};
-        if text.starts_with("@") || text.starts_with("/") {
+        if text.starts_with(['@', '/']) {
             match text.split_once(' ') {
                 Some((_, r)) => text = r,
                 None => continue,

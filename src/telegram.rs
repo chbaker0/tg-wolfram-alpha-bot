@@ -4,7 +4,7 @@ use bytes::Bytes;
 use eyre::{Context, Result};
 use reqwest::multipart::{Form, Part};
 use reqwest::Client;
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::{Deserialize, Serialize};
 
 pub struct Api {
@@ -20,7 +20,7 @@ impl Api {
     }
 
     pub async fn get_me(&self, client: &Client) -> Result<User> {
-        self.call_method::<(), _>(client, "getMe", None).await
+        self.call_method::<(), _>(client, "getMe", None, None).await
     }
 
     pub async fn get_updates(
@@ -30,7 +30,8 @@ impl Api {
         timeout: u64,
     ) -> Result<Vec<Update>> {
         let args = GetUpdatesArgs { offset, timeout };
-        self.call_method(client, "getUpdates", Some(args)).await
+        self.call_method(client, "getUpdates", Some(args), None)
+            .await
     }
 
     pub async fn send_photo(
@@ -50,19 +51,15 @@ impl Api {
         let photo_part = Part::bytes(data.to_vec())
             .file_name("photo")
             .mime_str(&content_type)?;
-        let form = Form::new().part("photo", photo_part);
 
-        let req = client
-            .post(self.method_url("sendPhoto"))
-            .query(&args)
-            .multipart(form)
-            .build()?;
-
-        println!("{req:?}");
-
-        let body: String = client.execute(req).await?.text().await?;
-        let resp: Reply<Message> = serde_json::from_str(&body).wrap_err_with(|| body.clone())?;
-        resp.into_result().map_err(eyre::Report::msg)?;
+        let _: IgnoredAny = self
+            .call_method(
+                client,
+                "sendPhoto",
+                Some(args),
+                Some(("photo".to_string(), photo_part)),
+            )
+            .await?;
         Ok(())
     }
 
@@ -71,13 +68,28 @@ impl Api {
         client: &Client,
         method_name: &str,
         body: Option<T>,
+        extra_part: Option<(String, Part)>,
     ) -> Result<U> {
-        let mut builder = client.get(self.method_url(method_name));
-        if let Some(body) = body {
-            builder = builder.json(&body);
-        }
-        let req = builder.build()?;
-        let resp: Reply<U> = client.execute(req).await?.json().await?;
+        let mut builder = client.post(self.method_url(method_name));
+        builder = match (body, extra_part) {
+            (None, None) => builder,
+            (Some(body), None) => builder.json(&body),
+            (Some(body), Some((name, part))) => {
+                let form = Form::new()
+                    .part(
+                        "tg_query",
+                        Part::text(serde_urlencoded::to_string(&body)?)
+                            .mime_str("application/x-www-form-urlencoded")?,
+                    )
+                    .part(name, part);
+                builder.multipart(form)
+            }
+            _ => unimplemented!(
+                "api does not accept extra multipart/form-data parts without a query body"
+            ),
+        };
+
+        let resp: Reply<U> = builder.send().await?.json().await?;
         resp.into_result()
             .map_err(eyre::Report::msg)
             .wrap_err("telegram API returned error")
