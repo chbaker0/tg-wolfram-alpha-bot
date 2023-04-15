@@ -3,7 +3,7 @@ mod wolfram;
 
 use std::sync::Arc;
 
-use tracing::{error, instrument};
+use tracing::{error, instrument, warn};
 
 use tokio::sync::mpsc as chan;
 
@@ -82,15 +82,28 @@ async fn handle_request_impl(
         return Ok(());
     }
 
-    let resp = wolfram.query(&reqw, text.to_string()).await?;
-    tg.send_photo(
-        &reqw,
-        msg.chat.id,
-        msg.message_id,
-        resp.image_data,
-        resp.content_type,
-    )
-    .await
+    match wolfram.query(&reqw, text.to_string()).await {
+        Ok(resp) => {
+            tg.send_photo(
+                &reqw,
+                msg.chat.id,
+                msg.message_id,
+                resp.image_data,
+                resp.content_type,
+            )
+            .await
+        }
+        Err(report) => {
+            warn!(report = ?report, "Wolfram Alpha request failed (maybe it couldn't handle the query?)");
+            tg.send_message(
+                &reqw,
+                msg.chat.id,
+                msg.message_id,
+                "Wolfram Alpha could not process this query".to_string(),
+            )
+            .await
+        }
+    }
 }
 
 async fn update_streamer(

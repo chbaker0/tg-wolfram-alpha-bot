@@ -34,6 +34,25 @@ impl Api {
             .await
     }
 
+    pub async fn send_message(
+        &self,
+        client: &Client,
+        chat_id: i64,
+        reply_to_message_id: i64,
+        text: String,
+    ) -> Result<()> {
+        let args = SendMessageArgs {
+            chat_id,
+            text,
+            reply_to_message_id,
+        };
+
+        let _: IgnoredAny = self
+            .call_method(client, "sendMessage", Some(args), None)
+            .await?;
+        Ok(())
+    }
+
     pub async fn send_photo(
         &self,
         client: &Client,
@@ -128,6 +147,13 @@ pub struct User {
 struct GetUpdatesArgs {
     offset: Option<i64>,
     timeout: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct SendMessageArgs {
+    chat_id: i64,
+    text: String,
+    reply_to_message_id: i64,
 }
 
 #[derive(Debug, Serialize)]

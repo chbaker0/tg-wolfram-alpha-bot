@@ -27,7 +27,9 @@ impl Api {
             .query(&q)
             .send()
             .await
-            .wrap_err("while sending Wolfram API query")?;
+            .wrap_err("while sending Wolfram API query")?
+            .error_for_status()
+            .wrap_err("wolfram API could not handle query")?;
 
         Ok(SimpleResponse {
             content_type: resp
