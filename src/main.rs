@@ -3,14 +3,18 @@ mod wolfram;
 
 use std::sync::Arc;
 
+use tracing::{error, instrument};
+
 use tokio::sync::mpsc as chan;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     color_eyre::install()?;
 
+    tracing_subscriber::fmt::init();
+
     let tg = Arc::new(telegram::Api::new(TELEGRAM_KEY.trim_end()));
-    let wolf = wolfram::Api::new(WOLFRAM_KEY.trim_end());
+    let wolf = Arc::new(wolfram::Api::new(WOLFRAM_KEY.trim_end()));
 
     let reqw = reqwest::Client::new();
 
@@ -26,31 +30,67 @@ async fn main() -> eyre::Result<()> {
     });
 
     while let Some(u) = receiver.recv().await {
-        let Some(msg) = &u.message else {continue};
-        let Some(mut text) = msg.text.as_deref() else {continue};
-        if text.starts_with(['@', '/']) {
-            match text.split_once(' ') {
-                Some((_, r)) => text = r,
-                None => continue,
-            }
-        }
+        let Some(msg) = u.message else {continue};
 
-        if text.is_empty() {
-            continue;
-        }
-
-        let resp = wolf.query(&reqw, text.to_string()).await?;
-        tg.send_photo(
-            &reqw,
-            msg.chat.id,
-            msg.message_id,
-            resp.image_data,
-            resp.content_type,
-        )
-        .await?;
+        // Spawn and ignore the handle, since the task doesn't return anything and
+        // logs any errors.
+        tokio::spawn({
+            let reqw = reqw.clone();
+            let tg = tg.clone();
+            let wolf = wolf.clone();
+            async move { handle_request(reqw, &tg, &wolf, msg).await }
+        });
     }
 
     tg_update_task.await?
+}
+
+#[instrument(skip(reqw, tg, wolfram))]
+async fn handle_request(
+    reqw: reqwest::Client,
+    tg: &telegram::Api,
+    wolfram: &wolfram::Api,
+    msg: telegram::Message,
+) {
+    match handle_request_impl(reqw, tg, wolfram, &msg).await {
+        Ok(()) => (),
+        Err(report) => {
+            error!(
+                msg.text, msg.chat.id,
+                report = ?report, "error handling Telegram query"
+            );
+        }
+    }
+}
+
+async fn handle_request_impl(
+    reqw: reqwest::Client,
+    tg: &telegram::Api,
+    wolfram: &wolfram::Api,
+    msg: &telegram::Message,
+) -> eyre::Result<()> {
+    let Some(mut text) = msg.text.as_deref() else {return Ok(())};
+
+    if text.starts_with(['@', '/']) {
+        match text.split_once(' ') {
+            Some((_, r)) => text = r,
+            None => return Ok(()),
+        }
+    }
+
+    if text.is_empty() {
+        return Ok(());
+    }
+
+    let resp = wolfram.query(&reqw, text.to_string()).await?;
+    tg.send_photo(
+        &reqw,
+        msg.chat.id,
+        msg.message_id,
+        resp.image_data,
+        resp.content_type,
+    )
+    .await
 }
 
 async fn update_streamer(
