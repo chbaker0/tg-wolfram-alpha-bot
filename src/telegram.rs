@@ -1,11 +1,28 @@
 //! Bindings for the Telegram bot API
 
 use bytes::Bytes;
-use eyre::{Context, Result};
 use reqwest::multipart::{Form, Part};
 use reqwest::Client;
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+pub type Result<T> = std::result::Result<T, ApiError>;
+
+#[derive(Debug, Error)]
+pub enum ApiError {
+    #[error("rate limited; telegram api asked us to retry after {0:?}")]
+    RetryAfter(std::time::Duration),
+    #[error("telegram api returned error: \"{0}\"")]
+    TelegramError(String),
+    #[error("api response is malformed")]
+    MalformedResponse,
+    #[error("error sending api request")]
+    ServiceError {
+        #[from]
+        source: reqwest::Error,
+    },
+}
 
 pub struct Api {
     url: String,
@@ -97,8 +114,11 @@ impl Api {
                 let form = Form::new()
                     .part(
                         "tg_query",
-                        Part::text(serde_urlencoded::to_string(&body)?)
-                            .mime_str("application/x-www-form-urlencoded")?,
+                        Part::text(
+                            serde_urlencoded::to_string(&body)
+                                .map_err(|_| ApiError::MalformedResponse)?,
+                        )
+                        .mime_str("application/x-www-form-urlencoded")?,
                     )
                     .part(name, part);
                 builder.multipart(form)
@@ -110,8 +130,6 @@ impl Api {
 
         let resp: Reply<U> = builder.send().await?.json().await?;
         resp.into_result()
-            .map_err(eyre::Report::msg)
-            .wrap_err("telegram API returned error")
     }
 
     fn method_url(&self, method_name: &str) -> String {
@@ -166,15 +184,34 @@ struct SendPhotoArgs {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum Reply<T> {
-    Success { result: T },
-    Fail { description: String },
+    Success {
+        result: T,
+    },
+    Fail {
+        description: String,
+        parameters: Option<ResponseParameters>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponseParameters {
+    retry_after: Option<u64>,
 }
 
 impl<T> Reply<T> {
-    fn into_result(self) -> Result<T, String> {
+    fn into_result(self) -> Result<T> {
         match self {
             Reply::Success { result } => Ok(result),
-            Reply::Fail { description } => Err(description),
+            Reply::Fail {
+                parameters:
+                    Some(ResponseParameters {
+                        retry_after: Some(seconds),
+                    }),
+                ..
+            } => Err(ApiError::RetryAfter(std::time::Duration::from_secs(
+                seconds,
+            ))),
+            Reply::Fail { description, .. } => Err(ApiError::TelegramError(description)),
         }
     }
 }

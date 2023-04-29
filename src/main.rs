@@ -3,7 +3,8 @@ mod wolfram;
 
 use std::sync::Arc;
 
-use tracing::{error, instrument, warn};
+use eyre::{bail, Context};
+use tracing::{error, instrument};
 
 use tokio::sync::mpsc as chan;
 
@@ -93,8 +94,7 @@ async fn handle_request_impl(
             )
             .await
         }
-        Err(report) => {
-            warn!(report = ?report, "Wolfram Alpha request failed (maybe it couldn't handle the query?)");
+        Err(wolfram::ApiError::InvalidQuery) => {
             tg.send_message(
                 &reqw,
                 msg.chat.id,
@@ -103,7 +103,17 @@ async fn handle_request_impl(
             )
             .await
         }
+        Err(_) => {
+            tg.send_message(
+                &reqw,
+                msg.chat.id,
+                msg.message_id,
+                "Could not contact Wolfram Alpha...try again?".to_string(),
+            )
+            .await
+        }
     }
+    .wrap_err("telegram api request failed")
 }
 
 async fn update_streamer(
@@ -113,15 +123,41 @@ async fn update_streamer(
 ) -> eyre::Result<()> {
     let poll_timeout = 30;
 
+    // Keep track of the number of consecutive failed requests. Retry until
+    // max_errs.
+    let max_errs = 3;
+    let mut err_count = 0;
+
     // The first getUpdates call technically should have no `offset` arg.
     let mut offset = None;
 
     loop {
-        for u in api
-            .get_updates(&client, offset, poll_timeout)
-            .await?
-            .into_iter()
-        {
+        let batch = match api.get_updates(&client, offset, poll_timeout).await {
+            Ok(b) => {
+                err_count = 0;
+                b
+            }
+            Err(telegram::ApiError::RetryAfter(d)) => {
+                // Don't count this as an error. Telegram gave us a well-formed
+                // response asking us to wait.
+                err_count = 0;
+                tokio::time::sleep(d).await;
+                continue;
+            }
+            Err(e) => {
+                // Got an error that can't be handled. Log an retry, until the
+                // max number of errors.
+                error!(e = ?e, "Telegram API error");
+                err_count += 1;
+                if err_count == max_errs {
+                    error!("Reached max number of retries");
+                    bail!(e);
+                }
+                continue;
+            }
+        };
+
+        for u in batch.into_iter() {
             // Bump the offset we call getUpdates with. This implicitly
             // acknowledges the updates received upon the next call.
             // Conveniently, `None` compares less than `Some(_)`.

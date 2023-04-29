@@ -1,9 +1,24 @@
 //! Bindings for the Wolfram Alpha API
 
 use bytes::Bytes;
-use eyre::{Context, Result};
 use reqwest::Client;
 use serde::Serialize;
+use thiserror::Error;
+
+pub type Result<T> = std::result::Result<T, ApiError>;
+
+#[derive(Debug, Error)]
+pub enum ApiError {
+    #[error("wolfram alpha could not interpret this query")]
+    InvalidQuery,
+    #[error("api response is malformed")]
+    MalformedResponse,
+    #[error("error sending api request")]
+    ServiceError {
+        #[from]
+        source: reqwest::Error,
+    },
+}
 
 pub struct Api {
     app_id: String,
@@ -22,21 +37,24 @@ impl Api {
             text,
         };
 
-        let resp = client
-            .get(API_URL)
-            .query(&q)
-            .send()
-            .await
-            .wrap_err("while sending Wolfram API query")?
-            .error_for_status()
-            .wrap_err("wolfram API could not handle query")?;
+        let resp = client.get(API_URL).query(&q).send().await?;
+        match resp.status() {
+            reqwest::StatusCode::OK => (),
+            reqwest::StatusCode::NOT_IMPLEMENTED => {
+                return Err(ApiError::InvalidQuery);
+            }
+            _ => {
+                resp.error_for_status()?;
+                unreachable!("received non-OK status code, but no error?")
+            }
+        }
 
         Ok(SimpleResponse {
             content_type: resp
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
-                .unwrap()
-                .to_str()?
+                .and_then(|s| s.to_str().ok())
+                .ok_or(ApiError::MalformedResponse)?
                 .to_string(),
             image_data: resp.bytes().await?,
         })
