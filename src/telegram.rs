@@ -25,35 +25,30 @@ pub enum ApiError {
 }
 
 pub struct Api {
+    client: Client,
     url: String,
 }
 
 impl Api {
-    pub fn new(bot_token: &str) -> Api {
+    pub fn new(client: Client, bot_token: &str) -> Api {
         const API_URL: &str = "https://api.telegram.org/bot";
         Api {
+            client,
             url: format!("{API_URL}{bot_token}"),
         }
     }
 
-    pub async fn get_me(&self, client: &Client) -> Result<User> {
-        self.call_method::<(), _>(client, "getMe", None, None).await
+    pub async fn get_me(&self) -> Result<User> {
+        self.call_method::<(), _>("getMe", None, None).await
     }
 
-    pub async fn get_updates(
-        &self,
-        client: &Client,
-        offset: Option<i64>,
-        timeout: u64,
-    ) -> Result<Vec<Update>> {
+    pub async fn get_updates(&self, offset: Option<i64>, timeout: u64) -> Result<Vec<Update>> {
         let args = GetUpdatesArgs { offset, timeout };
-        self.call_method(client, "getUpdates", Some(args), None)
-            .await
+        self.call_method("getUpdates", Some(args), None).await
     }
 
     pub async fn send_message(
         &self,
-        client: &Client,
         chat_id: i64,
         reply_to_message_id: i64,
         text: String,
@@ -64,15 +59,12 @@ impl Api {
             reply_to_message_id,
         };
 
-        let _: IgnoredAny = self
-            .call_method(client, "sendMessage", Some(args), None)
-            .await?;
+        let _: IgnoredAny = self.call_method("sendMessage", Some(args), None).await?;
         Ok(())
     }
 
     pub async fn send_photo(
         &self,
-        client: &Client,
         chat_id: i64,
         reply_to_message_id: i64,
         data: Bytes,
@@ -90,7 +82,6 @@ impl Api {
 
         let _: IgnoredAny = self
             .call_method(
-                client,
                 "sendPhoto",
                 Some(args),
                 Some(("photo".to_string(), photo_part)),
@@ -101,12 +92,11 @@ impl Api {
 
     async fn call_method<'a, T: Serialize, U: DeserializeOwned>(
         &self,
-        client: &Client,
         method_name: &str,
         body: Option<T>,
         extra_part: Option<(String, Part)>,
     ) -> Result<U> {
-        let mut builder = client.post(self.method_url(method_name));
+        let mut builder = self.client.post(self.method_url(method_name));
         builder = match (body, extra_part) {
             (None, None) => builder,
             (Some(body), None) => builder.json(&body),

@@ -21,20 +21,19 @@ async fn main() -> eyre::Result<()> {
             .init();
     }
 
-    let tg = Arc::new(telegram::Api::new(TELEGRAM_KEY.trim_end()));
-    let wolf = Arc::new(wolfram::Api::new(WOLFRAM_KEY.trim_end()));
-
     let reqw = reqwest::Client::new();
 
-    let me = tg.get_me(&reqw).await?;
+    let tg = Arc::new(telegram::Api::new(reqw.clone(), TELEGRAM_KEY.trim_end()));
+    let wolf = Arc::new(wolfram::Api::new(reqw.clone(), WOLFRAM_KEY.trim_end()));
+
+    let me = tg.get_me().await?;
     println!("ID: {}", me.id);
     eyre::ensure!(me.is_bot, "we're not a bot?");
 
     let (sender, mut receiver) = chan::channel(100);
     let tg_update_task = tokio::spawn({
         let tg = tg.clone();
-        let reqw = reqw.clone();
-        async move { update_streamer(&tg, reqw, sender).await }
+        async move { update_streamer(&tg, sender).await }
     });
 
     while let Some(u) = receiver.recv().await {
@@ -43,24 +42,18 @@ async fn main() -> eyre::Result<()> {
         // Spawn and ignore the handle, since the task doesn't return anything and
         // logs any errors.
         tokio::spawn({
-            let reqw = reqw.clone();
             let tg = tg.clone();
             let wolf = wolf.clone();
-            async move { handle_request(reqw, &tg, &wolf, msg).await }
+            async move { handle_request(&tg, &wolf, msg).await }
         });
     }
 
     tg_update_task.await?
 }
 
-#[instrument(skip(reqw, tg, wolfram))]
-async fn handle_request(
-    reqw: reqwest::Client,
-    tg: &telegram::Api,
-    wolfram: &wolfram::Api,
-    msg: telegram::Message,
-) {
-    match handle_request_impl(reqw, tg, wolfram, &msg).await {
+#[instrument(skip(tg, wolfram))]
+async fn handle_request(tg: &telegram::Api, wolfram: &wolfram::Api, msg: telegram::Message) {
+    match handle_request_impl(tg, wolfram, &msg).await {
         Ok(()) => (),
         Err(report) => {
             error!(
@@ -72,7 +65,6 @@ async fn handle_request(
 }
 
 async fn handle_request_impl(
-    reqw: reqwest::Client,
     tg: &telegram::Api,
     wolfram: &wolfram::Api,
     msg: &telegram::Message,
@@ -90,10 +82,9 @@ async fn handle_request_impl(
         return Ok(());
     }
 
-    match wolfram.query(&reqw, text.to_string()).await {
+    match wolfram.query(text.to_string()).await {
         Ok(resp) => {
             tg.send_photo(
-                &reqw,
                 msg.chat.id,
                 msg.message_id,
                 resp.image_data,
@@ -103,7 +94,6 @@ async fn handle_request_impl(
         }
         Err(wolfram::ApiError::InvalidQuery) => {
             tg.send_message(
-                &reqw,
                 msg.chat.id,
                 msg.message_id,
                 "Wolfram Alpha could not process this query".to_string(),
@@ -112,7 +102,6 @@ async fn handle_request_impl(
         }
         Err(_) => {
             tg.send_message(
-                &reqw,
                 msg.chat.id,
                 msg.message_id,
                 "Could not contact Wolfram Alpha...try again?".to_string(),
@@ -125,7 +114,6 @@ async fn handle_request_impl(
 
 async fn update_streamer(
     api: &telegram::Api,
-    client: reqwest::Client,
     sink: chan::Sender<telegram::Update>,
 ) -> eyre::Result<()> {
     let poll_timeout = 30;
@@ -139,7 +127,7 @@ async fn update_streamer(
     let mut offset = None;
 
     loop {
-        let batch = match api.get_updates(&client, offset, poll_timeout).await {
+        let batch = match api.get_updates(offset, poll_timeout).await {
             Ok(b) => {
                 err_count = 0;
                 b

@@ -21,23 +21,25 @@ pub enum ApiError {
 }
 
 pub struct Api {
+    client: Client,
     app_id: String,
 }
 
 impl Api {
-    pub fn new(app_id: &str) -> Api {
+    pub fn new(client: Client, app_id: &str) -> Api {
         Api {
+            client,
             app_id: app_id.to_string(),
         }
     }
 
-    pub async fn query(&self, client: &Client, text: String) -> Result<SimpleResponse> {
+    pub async fn query(&self, text: String) -> Result<SimpleResponse> {
         let q = Query {
             app_id: self.app_id.clone(),
             text,
         };
 
-        let resp = client.get(API_URL).query(&q).send().await?;
+        let resp = self.client.get(API_URL).query(&q).send().await?;
         match resp.status() {
             reqwest::StatusCode::OK => (),
             reqwest::StatusCode::NOT_IMPLEMENTED => {
