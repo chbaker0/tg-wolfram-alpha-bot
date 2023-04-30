@@ -6,6 +6,7 @@ use reqwest::Client;
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tower::Service;
 
 pub type Result<T> = std::result::Result<T, ApiError>;
 
@@ -15,8 +16,8 @@ pub enum ApiError {
     RetryAfter(std::time::Duration),
     #[error("telegram api returned error: \"{0}\"")]
     TelegramError(String),
-    #[error("api response is malformed")]
-    MalformedResponse,
+    #[error("api response is malformed: \"{0}\"")]
+    MalformedResponse(String),
     #[error("error sending api request")]
     ServiceError {
         #[from]
@@ -29,6 +30,20 @@ pub struct Api {
     url: String,
 }
 
+pub trait Query {
+    type Body: Serialize;
+    type Response: DeserializeOwned;
+    const ENDPOINT: &'static str;
+
+    fn construct(self) -> (Self::Body, Option<(String, Part)>);
+}
+
+/// Represents an empty (or ignored) response. `()` doesn't work on its own
+/// since a JSON dict won't deserialize into that, even if we want to ignore the
+/// value.
+#[derive(Deserialize)]
+pub struct Empty(IgnoredAny);
+
 impl Api {
     pub fn new(client: Client, bot_token: &str) -> Api {
         const API_URL: &str = "https://api.telegram.org/bot";
@@ -38,87 +53,26 @@ impl Api {
         }
     }
 
-    pub async fn get_me(&self) -> Result<User> {
-        self.call_method::<(), _>("getMe", None, None).await
-    }
-
-    pub async fn get_updates(&self, offset: Option<i64>, timeout: u64) -> Result<Vec<Update>> {
-        let args = GetUpdatesArgs { offset, timeout };
-        self.call_method("getUpdates", Some(args), None).await
-    }
-
-    pub async fn send_message(
-        &self,
-        chat_id: i64,
-        reply_to_message_id: i64,
-        text: String,
-    ) -> Result<()> {
-        let args = SendMessageArgs {
-            chat_id,
-            text,
-            reply_to_message_id,
-        };
-
-        let _: IgnoredAny = self.call_method("sendMessage", Some(args), None).await?;
-        Ok(())
-    }
-
-    pub async fn send_photo(
-        &self,
-        chat_id: i64,
-        reply_to_message_id: i64,
-        data: Bytes,
-        content_type: String,
-    ) -> Result<()> {
-        let args = SendPhotoArgs {
-            chat_id,
-            photo: "attach://photo".to_string(),
-            reply_to_message_id,
-        };
-
-        let photo_part = Part::bytes(data.to_vec())
-            .file_name("photo")
-            .mime_str(&content_type)?;
-
-        let _: IgnoredAny = self
-            .call_method(
-                "sendPhoto",
-                Some(args),
-                Some(("photo".to_string(), photo_part)),
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn call_method<'a, T: Serialize, U: DeserializeOwned>(
-        &self,
-        method_name: &str,
-        body: Option<T>,
-        extra_part: Option<(String, Part)>,
-    ) -> Result<U> {
-        let mut builder = self.client.post(self.method_url(method_name));
-        builder = match (body, extra_part) {
-            (None, None) => builder,
-            (Some(body), None) => builder.json(&body),
-            (Some(body), Some((name, part))) => {
-                let form = Form::new()
-                    .part(
-                        "tg_query",
-                        Part::text(
-                            serde_urlencoded::to_string(&body)
-                                .map_err(|_| ApiError::MalformedResponse)?,
-                        )
+    pub async fn call<Q: Query>(&self, query: Q) -> Result<Q::Response> {
+        let (body, extra_part) = query.construct();
+        let mut builder = self.client.post(self.method_url(Q::ENDPOINT));
+        builder = if let Some((name, part)) = extra_part {
+            let form = Form::new()
+                .part(
+                    "tg_query",
+                    Part::text(serde_urlencoded::to_string(&body).unwrap())
                         .mime_str("application/x-www-form-urlencoded")?,
-                    )
-                    .part(name, part);
-                builder.multipart(form)
-            }
-            _ => unimplemented!(
-                "api does not accept extra multipart/form-data parts without a query body"
-            ),
+                )
+                .part(name, part);
+            builder.multipart(form)
+        } else {
+            builder.json(&body)
         };
 
-        let resp: Reply<U> = builder.send().await?.json().await?;
+        let resp = builder.send().await?.text().await?;
+
+        let resp: Reply<Q::Response> =
+            serde_json::from_str(&resp).map_err(|_| ApiError::MalformedResponse(resp))?;
         resp.into_result()
     }
 
@@ -151,21 +105,81 @@ pub struct User {
     pub is_bot: bool,
 }
 
-#[derive(Debug, Serialize)]
-struct GetUpdatesArgs {
-    offset: Option<i64>,
-    timeout: u64,
+macro_rules! default_query_impl {
+    ($t:ty, $resp:ty, $endpoint:literal) => {
+        impl Query for $t {
+            type Body = Self;
+            type Response = $resp;
+            const ENDPOINT: &'static str = $endpoint;
+
+            fn construct(self) -> (Self, Option<(String, Part)>) {
+                (self, None)
+            }
+        }
+    };
 }
 
 #[derive(Debug, Serialize)]
-struct SendMessageArgs {
-    chat_id: i64,
-    text: String,
-    reply_to_message_id: i64,
+pub struct GetMe;
+
+default_query_impl!(GetMe, User, "getMe");
+
+#[derive(Debug, Serialize)]
+pub struct GetUpdates {
+    pub offset: Option<i64>,
+    pub timeout: u64,
+}
+
+default_query_impl!(GetUpdates, Vec<Update>, "getUpdates");
+
+#[derive(Debug, Serialize)]
+pub struct SendMessage {
+    pub chat_id: i64,
+    pub text: String,
+    pub reply_to_message_id: i64,
+}
+
+default_query_impl!(SendMessage, Empty, "sendMessage");
+
+pub struct SendPhoto {
+    body: SendPhotoBody,
+    part: Part,
+}
+
+impl SendPhoto {
+    /// Construct the query. Fails if `content_type` is not a valid mime type.
+    pub fn new(
+        chat_id: i64,
+        reply_to_message_id: i64,
+        data: Bytes,
+        content_type: String,
+    ) -> Option<Self> {
+        let body = SendPhotoBody {
+            chat_id,
+            photo: "attach://photo".to_string(),
+            reply_to_message_id,
+        };
+
+        let part = Part::bytes(data.to_vec())
+            .file_name("photo")
+            .mime_str(&content_type)
+            .ok()?;
+        Some(SendPhoto { body, part })
+    }
+}
+
+impl Query for SendPhoto {
+    type Body = SendPhotoBody;
+    type Response = Empty;
+    const ENDPOINT: &'static str = "sendPhoto";
+
+    fn construct(self) -> (Self::Body, Option<(String, Part)>) {
+        (self.body, Some(("photo".to_string(), self.part)))
+    }
 }
 
 #[derive(Debug, Serialize)]
-struct SendPhotoArgs {
+pub struct SendPhotoBody {
     chat_id: i64,
     photo: String,
     reply_to_message_id: i64,

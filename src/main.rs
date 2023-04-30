@@ -26,7 +26,7 @@ async fn main() -> eyre::Result<()> {
     let tg = Arc::new(telegram::Api::new(reqw.clone(), TELEGRAM_KEY.trim_end()));
     let wolf = Arc::new(wolfram::Api::new(reqw.clone(), WOLFRAM_KEY.trim_end()));
 
-    let me = tg.get_me().await?;
+    let me = tg.call(telegram::GetMe).await?;
     println!("ID: {}", me.id);
     eyre::ensure!(me.is_bot, "we're not a bot?");
 
@@ -82,33 +82,33 @@ async fn handle_request_impl(
         return Ok(());
     }
 
+    let send_message = |text| {
+        tg.call(telegram::SendMessage {
+            chat_id: msg.chat.id,
+            reply_to_message_id: msg.message_id,
+            text,
+        })
+    };
+
     match wolfram.query(text.to_string()).await {
         Ok(resp) => {
-            tg.send_photo(
+            if let Some(q) = telegram::SendPhoto::new(
                 msg.chat.id,
                 msg.message_id,
                 resp.image_data,
                 resp.content_type,
-            )
-            .await
+            ) {
+                tg.call(q).await
+            } else {
+                send_message("Wolfram Alpha sent a bad image".to_string()).await
+            }
         }
         Err(wolfram::ApiError::InvalidQuery) => {
-            tg.send_message(
-                msg.chat.id,
-                msg.message_id,
-                "Wolfram Alpha could not process this query".to_string(),
-            )
-            .await
+            send_message("Wolfram Alpha could not process this query".to_string()).await
         }
-        Err(_) => {
-            tg.send_message(
-                msg.chat.id,
-                msg.message_id,
-                "Could not contact Wolfram Alpha...try again?".to_string(),
-            )
-            .await
-        }
+        Err(_) => send_message("Could not contact Wolfram Alpha...try again?".to_string()).await,
     }
+    .map(|_| ())
     .wrap_err("telegram api request failed")
 }
 
@@ -116,7 +116,7 @@ async fn update_streamer(
     api: &telegram::Api,
     sink: chan::Sender<telegram::Update>,
 ) -> eyre::Result<()> {
-    let poll_timeout = 30;
+    let timeout = 30;
 
     // Keep track of the number of consecutive failed requests. Retry until
     // max_errs.
@@ -127,7 +127,7 @@ async fn update_streamer(
     let mut offset = None;
 
     loop {
-        let batch = match api.get_updates(offset, poll_timeout).await {
+        let batch = match api.call(telegram::GetUpdates { offset, timeout }).await {
             Ok(b) => {
                 err_count = 0;
                 b
