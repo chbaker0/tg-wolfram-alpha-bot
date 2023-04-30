@@ -1437,5 +1437,6 @@ dependencies = [
  "tokio",
  "tower-service",
  "tracing",
+ "tracing-error",
  "tracing-subscriber",
 ]

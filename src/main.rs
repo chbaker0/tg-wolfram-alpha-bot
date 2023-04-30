@@ -12,7 +12,14 @@ use tokio::sync::mpsc as chan;
 async fn main() -> eyre::Result<()> {
     color_eyre::install()?;
 
-    tracing_subscriber::fmt::init();
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        tracing_subscriber::fmt::fmt()
+            .finish()
+            .with(tracing_error::ErrorLayer::default())
+            .init();
+    }
 
     let tg = Arc::new(telegram::Api::new(TELEGRAM_KEY.trim_end()));
     let wolf = Arc::new(wolfram::Api::new(WOLFRAM_KEY.trim_end()));
