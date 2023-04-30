@@ -1,14 +1,18 @@
+#![feature(never_type)]
+
+mod http_service;
 mod telegram;
 mod wolfram;
 
 use std::sync::Arc;
 
 use eyre::{bail, Context};
+use tower::Service;
 use tracing::{error, instrument};
 
 use tokio::sync::mpsc as chan;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> eyre::Result<()> {
     color_eyre::install()?;
 
@@ -21,19 +25,24 @@ async fn main() -> eyre::Result<()> {
             .init();
     }
 
-    let reqw = reqwest::Client::new();
+    let _guard = tokio::task::LocalSet::new().enter();
 
-    let tg = Arc::new(telegram::Api::new(reqw.clone(), TELEGRAM_KEY.trim_end()));
-    let wolf = Arc::new(wolfram::Api::new(reqw.clone(), WOLFRAM_KEY.trim_end()));
+    let client = reqwest::Client::new();
 
-    let me = tg.call(telegram::GetMe).await?;
+    let tg = Arc::new(telegram::Api::new(TELEGRAM_KEY.trim_end()));
+    let wolf = Arc::new(wolfram::Api::new(client.clone(), WOLFRAM_KEY.trim_end()));
+
+    let client = http_service::Client::new(client);
+
+    let me = tg.on(&client).call(telegram::GetMe).await?;
     println!("ID: {}", me.id);
     eyre::ensure!(me.is_bot, "we're not a bot?");
 
     let (sender, mut receiver) = chan::channel(100);
-    let tg_update_task = tokio::spawn({
+    let tg_update_task = tokio::task::spawn({
+        let client = client.clone();
         let tg = tg.clone();
-        async move { update_streamer(&tg, sender).await }
+        async move { update_streamer(client, &tg, sender).await }
     });
 
     while let Some(u) = receiver.recv().await {
@@ -41,19 +50,20 @@ async fn main() -> eyre::Result<()> {
 
         // Spawn and ignore the handle, since the task doesn't return anything and
         // logs any errors.
-        tokio::spawn({
-            let tg = tg.clone();
-            let wolf = wolf.clone();
-            async move { handle_request(&tg, &wolf, msg).await }
-        });
+        handle_request(client.clone(), &tg, &wolf, msg).await;
     }
 
     tg_update_task.await?
 }
 
-#[instrument(skip(tg, wolfram))]
-async fn handle_request(tg: &telegram::Api, wolfram: &wolfram::Api, msg: telegram::Message) {
-    match handle_request_impl(tg, wolfram, &msg).await {
+#[instrument(skip(client, tg, wolfram))]
+async fn handle_request(
+    client: http_service::Client,
+    tg: &telegram::Api,
+    wolfram: &wolfram::Api,
+    msg: telegram::Message,
+) {
+    match handle_request_impl(client, tg, wolfram, &msg).await {
         Ok(()) => (),
         Err(report) => {
             error!(
@@ -65,10 +75,12 @@ async fn handle_request(tg: &telegram::Api, wolfram: &wolfram::Api, msg: telegra
 }
 
 async fn handle_request_impl(
+    client: http_service::Client,
     tg: &telegram::Api,
     wolfram: &wolfram::Api,
     msg: &telegram::Message,
 ) -> eyre::Result<()> {
+    tracing::info!(msg.text);
     let Some(mut text) = msg.text.as_deref() else {return Ok(())};
 
     if text.starts_with(['@', '/']) {
@@ -83,11 +95,14 @@ async fn handle_request_impl(
     }
 
     let send_message = |text| {
-        tg.call(telegram::SendMessage {
-            chat_id: msg.chat.id,
-            reply_to_message_id: msg.message_id,
-            text,
-        })
+        tg.call(
+            client.clone(),
+            telegram::SendMessage {
+                chat_id: msg.chat.id,
+                reply_to_message_id: msg.message_id,
+                text,
+            },
+        )
     };
 
     match wolfram.query(text.to_string()).await {
@@ -98,7 +113,7 @@ async fn handle_request_impl(
                 resp.image_data,
                 resp.content_type,
             ) {
-                tg.call(q).await
+                tg.call(client.clone(), q).await
             } else {
                 send_message("Wolfram Alpha sent a bad image".to_string()).await
             }
@@ -113,6 +128,7 @@ async fn handle_request_impl(
 }
 
 async fn update_streamer(
+    client: http_service::Client,
     api: &telegram::Api,
     sink: chan::Sender<telegram::Update>,
 ) -> eyre::Result<()> {
@@ -127,7 +143,13 @@ async fn update_streamer(
     let mut offset = None;
 
     loop {
-        let batch = match api.call(telegram::GetUpdates { offset, timeout }).await {
+        let batch = match async {
+            tracing::info!(offset);
+            api.call(client.clone(), telegram::GetUpdates { offset, timeout })
+                .await
+        }
+        .await
+        {
             Ok(b) => {
                 err_count = 0;
                 b
@@ -157,7 +179,7 @@ async fn update_streamer(
             // acknowledges the updates received upon the next call.
             // Conveniently, `None` compares less than `Some(_)`.
             offset = std::cmp::max(offset, Some(u.update_id + 1));
-            println!("{u:?}");
+            tracing::info!(offset, u = ?u);
 
             sink.send(u).await?;
         }

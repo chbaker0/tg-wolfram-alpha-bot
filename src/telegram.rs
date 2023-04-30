@@ -1,17 +1,18 @@
 //! Bindings for the Telegram bot API
 
+use crate::http_service::{Body, FormPart, Method, Request, Response, Url};
+
+use std::future::Future;
+use std::sync::Arc;
+
 use bytes::Bytes;
-use reqwest::multipart::{Form, Part};
-use reqwest::Client;
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tower::Service;
 
-pub type Result<T> = std::result::Result<T, ApiError>;
-
 #[derive(Debug, Error)]
-pub enum ApiError {
+pub enum ApiError<Inner> {
     #[error("rate limited; telegram api asked us to retry after {0:?}")]
     RetryAfter(std::time::Duration),
     #[error("telegram api returned error: \"{0}\"")]
@@ -21,21 +22,130 @@ pub enum ApiError {
     #[error("error sending api request")]
     ServiceError {
         #[from]
-        source: reqwest::Error,
+        source: Inner,
+    },
+    #[error("other error")]
+    OtherError {
+        #[source]
+        source: eyre::Report,
     },
 }
 
+#[derive(Clone)]
 pub struct Api {
-    client: Client,
-    url: String,
+    url: Arc<Url>,
 }
 
-pub trait Query {
-    type Body: Serialize;
+impl Api {
+    pub fn new(bot_token: &str) -> Self {
+        const API_URL: &str = "https://api.telegram.org/bot";
+        Api {
+            url: Arc::new(Url::parse(&format!("{API_URL}{bot_token}/")).unwrap()),
+        }
+    }
+
+    pub fn on<S: Service<Request, Response = Response> + Send + Clone>(
+        &self,
+        client: &S,
+    ) -> ApiOn<S> {
+        ApiOn {
+            url: self.url.clone(),
+            client: Some(client.clone()),
+        }
+    }
+
+    pub async fn call<Q, S>(&self, client: S, query: Q) -> Result<Q::Response, ApiError<S::Error>>
+    where
+        Q: Query + 'static,
+        S: Service<Request, Response = Response> + Send + Clone + 'static,
+        S::Future: Send,
+        S::Error: Send,
+    {
+        self.on(&client).call(query).await
+    }
+}
+
+fn method_url(base: &Url, method: &str) -> Url {
+    base.join(method).unwrap()
+}
+
+pub struct ApiOn<S> {
+    url: Arc<Url>,
+    client: Option<S>,
+}
+
+impl<Q: Query, S> Service<Q> for ApiOn<S>
+where
+    S: Service<Request, Response = Response> + Send + 'static,
+    S::Future: Send,
+    S::Error: Send,
+    Q: 'static,
+{
+    type Response = Q::Response;
+    type Error = ApiError<S::Error>;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        assert!(self.client.is_some());
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, query: Q) -> Self::Future {
+        let url = method_url(&self.url, Q::ENDPOINT);
+        Box::pin(do_call(self.client.take().unwrap(), query, url))
+    }
+}
+
+async fn do_call<Q: Query, S: Service<Request, Response = Response>>(
+    mut client: S,
+    query: Q,
+    url: Url,
+) -> Result<Q::Response, ApiError<S::Error>> {
+    let (body, extra_part) = query.construct();
+    let body = if let Some(part) = extra_part {
+        Body::Multipart(vec![
+            FormPart {
+                name: "tg_query".to_string(),
+                file_name: None,
+                mime_str: Some("application/x-www-form-urlencoded".to_string()),
+                value: serde_urlencoded::to_string(&body).unwrap().into(),
+            },
+            part,
+        ])
+    } else {
+        Body::Normal(serde_json::to_string(&body).unwrap().into())
+    };
+
+    use tower::ServiceExt;
+    let client = client.ready().await?;
+
+    let resp = client
+        .call(Request {
+            method: Method::POST,
+            url,
+            body,
+        })
+        .await?
+        .text()
+        .await
+        .map_err(|e| ApiError::OtherError { source: e.into() })?;
+
+    let resp: Reply<Q::Response> =
+        serde_json::from_str(&resp).map_err(|_| ApiError::MalformedResponse(resp))?;
+    resp.into_result()
+}
+
+pub trait Query: Send {
+    type Body: Serialize + Send;
     type Response: DeserializeOwned;
     const ENDPOINT: &'static str;
 
-    fn construct(self) -> (Self::Body, Option<(String, Part)>);
+    fn construct(self) -> (Self::Body, Option<FormPart>);
 }
 
 /// Represents an empty (or ignored) response. `()` doesn't work on its own
@@ -43,43 +153,6 @@ pub trait Query {
 /// value.
 #[derive(Deserialize)]
 pub struct Empty(IgnoredAny);
-
-impl Api {
-    pub fn new(client: Client, bot_token: &str) -> Api {
-        const API_URL: &str = "https://api.telegram.org/bot";
-        Api {
-            client,
-            url: format!("{API_URL}{bot_token}"),
-        }
-    }
-
-    pub async fn call<Q: Query>(&self, query: Q) -> Result<Q::Response> {
-        let (body, extra_part) = query.construct();
-        let mut builder = self.client.post(self.method_url(Q::ENDPOINT));
-        builder = if let Some((name, part)) = extra_part {
-            let form = Form::new()
-                .part(
-                    "tg_query",
-                    Part::text(serde_urlencoded::to_string(&body).unwrap())
-                        .mime_str("application/x-www-form-urlencoded")?,
-                )
-                .part(name, part);
-            builder.multipart(form)
-        } else {
-            builder.json(&body)
-        };
-
-        let resp = builder.send().await?.text().await?;
-
-        let resp: Reply<Q::Response> =
-            serde_json::from_str(&resp).map_err(|_| ApiError::MalformedResponse(resp))?;
-        resp.into_result()
-    }
-
-    fn method_url(&self, method_name: &str) -> String {
-        format!("{}/{}", self.url, method_name)
-    }
-}
 
 #[derive(Debug, Deserialize)]
 pub struct Update {
@@ -112,7 +185,7 @@ macro_rules! default_query_impl {
             type Response = $resp;
             const ENDPOINT: &'static str = $endpoint;
 
-            fn construct(self) -> (Self, Option<(String, Part)>) {
+            fn construct(self) -> (Self, Option<FormPart>) {
                 (self, None)
             }
         }
@@ -143,7 +216,7 @@ default_query_impl!(SendMessage, Empty, "sendMessage");
 
 pub struct SendPhoto {
     body: SendPhotoBody,
-    part: Part,
+    part: FormPart,
 }
 
 impl SendPhoto {
@@ -160,10 +233,12 @@ impl SendPhoto {
             reply_to_message_id,
         };
 
-        let part = Part::bytes(data.to_vec())
-            .file_name("photo")
-            .mime_str(&content_type)
-            .ok()?;
+        let part = FormPart {
+            name: "photo".to_string(),
+            file_name: Some("photo".to_string()),
+            mime_str: Some(content_type),
+            value: data,
+        };
         Some(SendPhoto { body, part })
     }
 }
@@ -173,8 +248,8 @@ impl Query for SendPhoto {
     type Response = Empty;
     const ENDPOINT: &'static str = "sendPhoto";
 
-    fn construct(self) -> (Self::Body, Option<(String, Part)>) {
-        (self.body, Some(("photo".to_string(), self.part)))
+    fn construct(self) -> (Self::Body, Option<FormPart>) {
+        (self.body, Some(self.part))
     }
 }
 
@@ -203,7 +278,7 @@ struct ResponseParameters {
 }
 
 impl<T> Reply<T> {
-    fn into_result(self) -> Result<T> {
+    fn into_result<E>(self) -> Result<T, ApiError<E>> {
         match self {
             Reply::Success { result } => Ok(result),
             Reply::Fail {
@@ -217,5 +292,51 @@ impl<T> Reply<T> {
             ))),
             Reply::Fail { description, .. } => Err(ApiError::TelegramError(description)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eyre::*;
+    use tower_test::*;
+
+    use crate::http_service as hs;
+
+    #[tokio::test]
+    async fn test() -> eyre::Result<()> {
+        let api = Api::new("fake");
+        let (mut m, mut handle) = mock::pair::<hs::Request, hs::Response>();
+        let task = tokio::spawn(async move {
+            let (req, _h) = handle.next_request().await.unwrap();
+            ensure!(req.method == Method::POST, "incorrect method");
+            ensure!(
+                req.url == Url::parse("https://api.telegram.org/botfake/getMe").unwrap(),
+                "incorrect url"
+            );
+            let Body::Normal(bytes) = req.body else { bail!("incorrect body type: {:?}", req.body)};
+
+            use serde_json::{json, Value};
+            let value: Value = serde_json::from_slice(&bytes)?;
+            ensure!(value == json!({}), "incorrect body: {value:?}");
+            Ok(())
+        });
+        let resp = api
+            .on(&mut m)
+            .call(GetMe)
+            .await
+            .map_err(|e| format_err!("{e:?}"))?;
+        task.await??;
+        ensure!(
+            matches!(
+                resp,
+                User {
+                    id: 42,
+                    is_bot: true
+                }
+            ),
+            "service did not reply correctly"
+        );
+        todo!()
     }
 }
