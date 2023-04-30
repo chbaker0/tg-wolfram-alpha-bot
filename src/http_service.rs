@@ -8,7 +8,7 @@ use bytes::Bytes;
 use tower::Service;
 
 pub use http::method::Method;
-pub use reqwest::{Error, Response, Result, Url};
+pub use reqwest::{Error, Result, Url};
 
 #[derive(Debug)]
 pub struct Request {
@@ -43,9 +43,9 @@ impl Client {
 }
 
 impl Service<Request> for Client {
-    type Response = Response;
+    type Response = Bytes;
     type Error = Error;
-    type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response>> + Send>>;
+    type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Bytes>> + Send>>;
 
     fn poll_ready(
         &mut self,
@@ -77,7 +77,7 @@ impl Service<Request> for Client {
         let client = self.inner.clone();
         Box::pin(async move {
             let req = builder?.build()?;
-            client.execute(req).await
+            client.execute(req).await?.bytes().await
         })
     }
 }

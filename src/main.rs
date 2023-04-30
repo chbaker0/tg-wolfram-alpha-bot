@@ -4,6 +4,9 @@ mod http_service;
 mod telegram;
 mod wolfram;
 
+#[cfg(test)]
+mod test_util;
+
 use std::sync::Arc;
 
 use eyre::{bail, Context};
@@ -12,8 +15,7 @@ use tracing::{error, instrument};
 
 use tokio::sync::mpsc as chan;
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> eyre::Result<()> {
+fn setup_tracing() -> eyre::Result<()> {
     color_eyre::install()?;
 
     {
@@ -24,6 +26,13 @@ async fn main() -> eyre::Result<()> {
             .with(tracing_error::ErrorLayer::default())
             .init();
     }
+
+    Ok(())
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> eyre::Result<()> {
+    setup_tracing()?;
 
     let _guard = tokio::task::LocalSet::new().enter();
 

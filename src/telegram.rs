@@ -1,8 +1,7 @@
 //! Bindings for the Telegram bot API
 
-use crate::http_service::{Body, FormPart, Method, Request, Response, Url};
+use crate::http_service::{Body, FormPart, Method, Request, Url};
 
-use std::future::Future;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -24,11 +23,6 @@ pub enum ApiError<Inner> {
         #[from]
         source: Inner,
     },
-    #[error("other error")]
-    OtherError {
-        #[source]
-        source: eyre::Report,
-    },
 }
 
 #[derive(Clone)]
@@ -44,10 +38,7 @@ impl Api {
         }
     }
 
-    pub fn on<S: Service<Request, Response = Response> + Send + Clone>(
-        &self,
-        client: &S,
-    ) -> ApiOn<S> {
+    pub fn on<S: Service<Request, Response = Bytes> + Send + Clone>(&self, client: &S) -> ApiOn<S> {
         ApiOn {
             url: self.url.clone(),
             client: Some(client.clone()),
@@ -57,7 +48,7 @@ impl Api {
     pub async fn call<Q, S>(&self, client: S, query: Q) -> Result<Q::Response, ApiError<S::Error>>
     where
         Q: Query + 'static,
-        S: Service<Request, Response = Response> + Send + Clone + 'static,
+        S: Service<Request, Response = Bytes> + Send + Clone + 'static,
         S::Future: Send,
         S::Error: Send,
     {
@@ -76,7 +67,7 @@ pub struct ApiOn<S> {
 
 impl<Q: Query, S> Service<Q> for ApiOn<S>
 where
-    S: Service<Request, Response = Response> + Send + 'static,
+    S: Service<Request, Response = Bytes> + Send + 'static,
     S::Future: Send,
     S::Error: Send,
     Q: 'static,
@@ -101,7 +92,8 @@ where
     }
 }
 
-async fn do_call<Q: Query, S: Service<Request, Response = Response>>(
+#[tracing::instrument(skip(client))]
+async fn do_call<Q: Query, S: Service<Request, Response = Bytes>>(
     mut client: S,
     query: Q,
     url: Url,
@@ -130,17 +122,14 @@ async fn do_call<Q: Query, S: Service<Request, Response = Response>>(
             url,
             body,
         })
-        .await?
-        .text()
-        .await
-        .map_err(|e| ApiError::OtherError { source: e.into() })?;
+        .await?;
 
-    let resp: Reply<Q::Response> =
-        serde_json::from_str(&resp).map_err(|_| ApiError::MalformedResponse(resp))?;
+    let resp: Reply<Q::Response> = serde_json::from_slice(&resp)
+        .map_err(|_| ApiError::MalformedResponse(String::from_utf8_lossy(&resp).into_owned()))?;
     resp.into_result()
 }
 
-pub trait Query: Send {
+pub trait Query: std::fmt::Debug + Send {
     type Body: Serialize + Send;
     type Response: DeserializeOwned;
     const ENDPOINT: &'static str;
@@ -172,7 +161,7 @@ pub struct Chat {
     pub id: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct User {
     pub id: i64,
     pub is_bot: bool,
@@ -214,6 +203,7 @@ pub struct SendMessage {
 
 default_query_impl!(SendMessage, Empty, "sendMessage");
 
+#[derive(Debug)]
 pub struct SendPhoto {
     body: SendPhotoBody,
     part: FormPart,
@@ -299,16 +289,20 @@ impl<T> Reply<T> {
 mod tests {
     use super::*;
     use eyre::*;
+    use tower::ServiceExt;
     use tower_test::*;
 
     use crate::http_service as hs;
+    use crate::test_util::*;
 
     #[tokio::test]
     async fn test() -> eyre::Result<()> {
+        crate::setup_tracing().unwrap();
+
         let api = Api::new("fake");
-        let (mut m, mut handle) = mock::pair::<hs::Request, hs::Response>();
+        let (m, mut handle) = mock::pair::<hs::Request, Bytes>();
         let task = tokio::spawn(async move {
-            let (req, _h) = handle.next_request().await.unwrap();
+            let (req, h) = handle.next_request().await.unwrap();
             ensure!(req.method == Method::POST, "incorrect method");
             ensure!(
                 req.url == Url::parse("https://api.telegram.org/botfake/getMe").unwrap(),
@@ -319,13 +313,20 @@ mod tests {
             use serde_json::{json, Value};
             let value: Value = serde_json::from_slice(&bytes)?;
             ensure!(value == json!({}), "incorrect body: {value:?}");
+            h.send_response(
+                serde_json::to_string(&User {
+                    id: 42,
+                    is_bot: true,
+                })
+                .unwrap()
+                .into(),
+            );
             Ok(())
         });
         let resp = api
-            .on(&mut m)
+            .on(&mut m.map_err(|e| EyreWrapper::from(eyre!(e))))
             .call(GetMe)
-            .await
-            .map_err(|e| format_err!("{e:?}"))?;
+            .await?;
         task.await??;
         ensure!(
             matches!(
