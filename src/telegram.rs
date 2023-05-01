@@ -13,12 +13,16 @@ use tracing::Instrument;
 
 #[derive(Debug, Error)]
 pub enum ApiError<Inner> {
+    /// Retry the request after the specified time.
     #[error("rate limited; telegram api asked us to retry after {0:?}")]
     RetryAfter(std::time::Duration),
+    /// Telegram returned an error for the request.
     #[error("telegram api returned error: \"{0}\"")]
     TelegramError(String),
+    /// Successfully received the response, but it wasn't well-formed.
     #[error("api response is malformed: \"{0}\"")]
     MalformedResponse(String),
+    /// The underlying transport (e.g. network or HTTP processing) failed.
     #[error("error sending api request")]
     ServiceError {
         #[from]
@@ -26,31 +30,30 @@ pub enum ApiError<Inner> {
     },
 }
 
-#[derive(Clone)]
-pub struct Api {
-    url: Arc<Url>,
+/// A valid Telegram Bot API query. Consumed on use.
+pub trait Query: std::fmt::Debug + Send {
+    /// The response type.
+    type Response: DeserializeOwned;
+
+    /// For internal use. The internal body that will be serialized to send.
+    type Body: Serialize + Send;
+
+    /// For internal use. The endpoint URL for this query.
+    const ENDPOINT: &'static str;
+
+    /// For internal use. Construct the actual message to be sent.
+    fn construct(self) -> (Self::Body, Option<FormPart>);
 }
 
-impl Api {
-    pub fn new(bot_token: &str) -> Self {
-        const API_URL: &str = "https://api.telegram.org/bot";
-        Api {
-            url: Arc::new(Url::parse(&format!("{API_URL}{bot_token}/")).unwrap()),
-        }
-    }
-
-    pub fn on<S: Service<Request, Response = Bytes> + Send + Clone>(&self, client: &S) -> ApiOn<S> {
-        ApiOn {
-            url: self.url.clone(),
-            client: client.clone(),
-            // client: Some(client.clone()),
-        }
-    }
-}
-
+/// The API session for a particular bot. This does nothing on its own.
+///
+/// An implementation knows how to construct an HTTP request for a query, send
+/// it on the underlying service, and parse the result.
 pub trait GenericApi<S, E> {
     type Handler<Q: Query + 'static>: Service<Q>;
     type Future<Q: Query + 'static>: std::future::Future<Output = Result<Q::Response, ApiError<E>>>;
+
+    /// Run `query` using `client` for HTTP.
     fn call<Q: Query + 'static>(&self, client: &S, query: Q) -> Self::Future<Q>;
 }
 
@@ -67,15 +70,17 @@ where
     }
 }
 
-fn method_url(base: &Url, method: &str) -> Url {
-    base.join(method).unwrap()
-}
-
+/// Generic API session. Given a query, sends it and returns a result.
+///
+/// This is generic so code using the Telegram API can be tested easier. In
+/// practice, this will be constructed from `Api::on` with a real HTTP service.
 pub trait GenericApiOn {
     type Error: std::error::Error + Send + Sync + 'static;
     type Future<Q: Query + 'static>: std::future::Future<
         Output = Result<Q::Response, ApiError<Self::Error>>,
     >;
+
+    /// Call `query` and get the result.
     fn do_call<Q: Query + 'static>(&self, query: Q) -> Self::Future<Q>;
 }
 
@@ -93,6 +98,37 @@ where
     }
 }
 
+/// Concrete API session.
+#[derive(Clone)]
+pub struct Api {
+    url: Arc<Url>,
+}
+
+impl Api {
+    pub fn new(bot_token: &str) -> Self {
+        const API_URL: &str = "https://api.telegram.org/bot";
+        Api {
+            url: Arc::new(Url::parse(&format!("{API_URL}{bot_token}/")).unwrap()),
+        }
+    }
+
+    /// Given a service we can send HTTP requests on, construct the service to
+    /// send Telegram queries. `client` should be cheaply cloneable (e.g.
+    /// reqwest::Client), which is a simple `Arc<_>` internally.
+    ///
+    /// The returned value implements both `GenericApiOn`, to send any Telegram
+    /// query, and `tower::Service<Q>` for all query types `Q`, for interop with
+    /// tower.
+    pub fn on<S: Service<Request, Response = Bytes> + Send + Clone>(&self, client: &S) -> ApiOn<S> {
+        ApiOn {
+            url: self.url.clone(),
+            client: client.clone(),
+        }
+    }
+}
+
+/// Concrete API session on a particular HTTP service. Meant to be transient,
+/// since all fields are cheaply constructed and cloned.
 #[derive(Clone)]
 pub struct ApiOn<S> {
     url: Arc<Url>,
@@ -124,6 +160,10 @@ where
         let url = method_url(&self.url, Q::ENDPOINT);
         Box::pin(do_call(self.client.clone(), query, url))
     }
+}
+
+fn method_url(base: &Url, method: &str) -> Url {
+    base.join(method).unwrap()
 }
 
 #[tracing::instrument(skip(client))]
@@ -166,14 +206,6 @@ async fn do_call<Q: Query, S: Service<Request, Response = Bytes>>(
     let resp: Reply<Q::Response> = serde_json::from_slice(&resp)
         .map_err(|_| ApiError::MalformedResponse(String::from_utf8_lossy(&resp).into_owned()))?;
     resp.into_result()
-}
-
-pub trait Query: std::fmt::Debug + Send {
-    type Body: Serialize + Send;
-    type Response: DeserializeOwned;
-    const ENDPOINT: &'static str;
-
-    fn construct(self) -> (Self::Body, Option<FormPart>);
 }
 
 /// Represents an empty (or ignored) response. `()` doesn't work on its own
