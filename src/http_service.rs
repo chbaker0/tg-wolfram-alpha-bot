@@ -50,6 +50,23 @@ impl Service<Request> for Client {
 
     fn poll_ready(
         &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+        <&Self as Service<Request>>::poll_ready(&mut &*self, cx)
+    }
+
+    fn call(&mut self, req: Request) -> Self::Future {
+        <&Self as Service<Request>>::call(&mut &*self, req)
+    }
+}
+
+impl<'a> Service<Request> for &'a Client {
+    type Response = Bytes;
+    type Error = Error;
+    type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Bytes>> + Send + Sync>>;
+
+    fn poll_ready(
+        &mut self,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
         std::task::Poll::Ready(Ok(()))

@@ -79,10 +79,7 @@ impl Bot {
     ///
     /// The returned value implements both `Client`, to send any Telegram query,
     /// and `tower::Service<Q>` for all query types `Q`, for interop with tower.
-    pub fn on<S: Service<Request, Response = Bytes> + Clone>(
-        &self,
-        client: S,
-    ) -> Instance<S> {
+    pub fn on<S: Service<Request, Response = Bytes> + Clone>(&self, client: S) -> Instance<S> {
         Instance {
             url: self.url.clone(),
             client,
@@ -121,13 +118,33 @@ where
 
     fn poll_ready(
         &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        <&Self as Service<Q>>::poll_ready(&mut &*self, cx)
+    }
+
+    fn call(&mut self, query: Q) -> Self::Future {
+        <&Self as Service<Q>>::call(&mut &*self, query)
+    }
+}
+
+impl<'a, Q: Query, S> Service<Q> for &'a Instance<S>
+where
+    S: Service<Request, Response = Bytes> + Clone,
+{
+    type Response = Q::Response;
+    type Error = ApiError<S::Error>;
+    type Future = DoCall<S, Q::Response>;
+
+    fn poll_ready(
+        &mut self,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
         std::task::Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, query: Q) -> Self::Future {
-        <Self as Client>::call(self, query)
+        (*self).call(query)
     }
 }
 
