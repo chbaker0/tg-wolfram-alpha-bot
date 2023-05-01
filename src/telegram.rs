@@ -39,22 +39,23 @@ impl Api {
         }
     }
 
-    pub fn on<S: Service<Request, Response = Bytes> + Send + Clone>(&self, client: &S) -> ApiOn<S> {
+    fn on<S: Service<Request, Response = Bytes> + Send + Clone>(&self, client: &S) -> ApiOn<S> {
         ApiOn {
             url: self.url.clone(),
             client: Some(client.clone()),
         }
     }
+}
 
-    pub async fn call<Q, S>(&self, client: S, query: Q) -> Result<Q::Response, ApiError<S::Error>>
-    where
-        Q: Query + 'static,
-        S: Service<Request, Response = Bytes> + Send + Clone + 'static,
-        S::Future: Send,
-        S::Error: Send,
-    {
-        self.on(&client).call(query).await
-    }
+pub trait GenericApi<S>
+where
+    S: Service<Request, Response = Bytes> + Send + Clone,
+{
+    type Handler<Q: Query + 'static>: Service<Q>;
+    type Future<Q: Query + 'static>: std::future::Future<
+        Output = Result<Q::Response, <Self::Handler<Q> as Service<Q>>::Error>,
+    >;
+    fn call<Q: Query + 'static>(&self, client: &S, query: Q) -> Self::Future<Q>;
 }
 
 fn method_url(base: &Url, method: &str) -> Url {
@@ -64,6 +65,19 @@ fn method_url(base: &Url, method: &str) -> Url {
 pub struct ApiOn<S> {
     url: Arc<Url>,
     client: Option<S>,
+}
+
+impl<S> GenericApi<S> for Api
+where
+    S: Service<Request, Response = Bytes> + Send + Clone + 'static,
+    <S as Service<Request>>::Future: Send,
+    <S as Service<Request>>::Error: Send,
+{
+    type Handler<Q: Query + 'static> = ApiOn<S>;
+    type Future<Q: Query + 'static> = <ApiOn<S> as Service<Q>>::Future;
+    fn call<Q: Query + 'static>(&self, client: &S, query: Q) -> Self::Future<Q> {
+        self.on(client).call(query)
+    }
 }
 
 impl<Q: Query, S> Service<Q> for ApiOn<S>

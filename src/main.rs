@@ -4,10 +4,12 @@ mod http_service;
 mod telegram;
 mod wolfram;
 
+use telegram::GenericApi;
+
 use std::sync::Arc;
 
 use eyre::{bail, Context};
-use tower::Service;
+// use tower::Service;
 use tracing::{error, instrument};
 
 use tokio::sync::mpsc as chan;
@@ -40,7 +42,7 @@ async fn main() -> eyre::Result<()> {
 
     let client = http_service::Client::new(client);
 
-    let me = tg.on(&client).call(telegram::GetMe).await?;
+    let me = tg.call(&client, telegram::GetMe).await?;
     println!("ID: {}", me.id);
     eyre::ensure!(me.is_bot, "we're not a bot?");
 
@@ -102,7 +104,7 @@ async fn handle_request_impl(
 
     let send_message = |text| {
         tg.call(
-            client.clone(),
+            &client,
             telegram::SendMessage {
                 chat_id: msg.chat.id,
                 reply_to_message_id: msg.message_id,
@@ -119,7 +121,7 @@ async fn handle_request_impl(
                 resp.image_data,
                 resp.content_type,
             ) {
-                tg.call(client.clone(), q).await
+                tg.call(&client, q).await
             } else {
                 send_message("Wolfram Alpha sent a bad image".to_string()).await
             }
@@ -151,7 +153,7 @@ async fn update_streamer(
     loop {
         let batch = match async {
             tracing::info!(offset);
-            api.call(client.clone(), telegram::GetUpdates { offset, timeout })
+            api.call(&client, telegram::GetUpdates { offset, timeout })
                 .await
         }
         .await

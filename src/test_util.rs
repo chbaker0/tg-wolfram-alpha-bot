@@ -1,6 +1,3 @@
 #[derive(Debug, thiserror::Error)]
-#[error("{inner:?}")]
-pub struct EyreWrapper {
-    #[from]
-    inner: eyre::Report,
-}
+#[error(transparent)]
+pub struct EyreWrapper(#[from] pub eyre::Report);
