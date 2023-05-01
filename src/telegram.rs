@@ -47,14 +47,9 @@ impl Api {
     }
 }
 
-pub trait GenericApi<S>
-where
-    S: Service<Request, Response = Bytes> + Send + Clone,
-{
+pub trait GenericApi<S, E> {
     type Handler<Q: Query + 'static>: Service<Q>;
-    type Future<Q: Query + 'static>: std::future::Future<
-        Output = Result<Q::Response, <Self::Handler<Q> as Service<Q>>::Error>,
-    >;
+    type Future<Q: Query + 'static>: std::future::Future<Output = Result<Q::Response, ApiError<E>>>;
     fn call<Q: Query + 'static>(&self, client: &S, query: Q) -> Self::Future<Q>;
 }
 
@@ -67,7 +62,7 @@ pub struct ApiOn<S> {
     client: Option<S>,
 }
 
-impl<S> GenericApi<S> for Api
+impl<S> GenericApi<S, S::Error> for Api
 where
     S: Service<Request, Response = Bytes> + Send + Clone + 'static,
     <S as Service<Request>>::Future: Send,

@@ -50,7 +50,7 @@ async fn main() -> eyre::Result<()> {
     let tg_update_task = tokio::task::spawn({
         let client = client.clone();
         let tg = tg.clone();
-        async move { update_streamer(client, &tg, sender).await }
+        async move { update_streamer(client, tg.as_ref(), sender).await }
     });
 
     while let Some(u) = receiver.recv().await {
@@ -58,16 +58,16 @@ async fn main() -> eyre::Result<()> {
 
         // Spawn and ignore the handle, since the task doesn't return anything and
         // logs any errors.
-        handle_request(client.clone(), &tg, &wolf, msg).await;
+        handle_request(client.clone(), tg.as_ref(), &wolf, msg).await;
     }
 
     tg_update_task.await?
 }
 
 #[instrument(skip(client, tg, wolfram))]
-async fn handle_request(
-    client: http_service::Client,
-    tg: &telegram::Api,
+async fn handle_request<S, E: std::error::Error + Send + Sync + 'static, Tg: GenericApi<S, E>>(
+    client: S,
+    tg: &Tg,
     wolfram: &wolfram::Api,
     msg: telegram::Message,
 ) {
@@ -82,9 +82,13 @@ async fn handle_request(
     }
 }
 
-async fn handle_request_impl(
-    client: http_service::Client,
-    tg: &telegram::Api,
+async fn handle_request_impl<
+    S,
+    E: std::error::Error + Send + Sync + 'static,
+    Tg: GenericApi<S, E>,
+>(
+    client: S,
+    tg: &Tg,
     wolfram: &wolfram::Api,
     msg: &telegram::Message,
 ) -> eyre::Result<()> {
@@ -135,9 +139,9 @@ async fn handle_request_impl(
     .wrap_err("telegram api request failed")
 }
 
-async fn update_streamer(
-    client: http_service::Client,
-    api: &telegram::Api,
+async fn update_streamer<S, E: std::error::Error + Send + Sync + 'static, Tg: GenericApi<S, E>>(
+    client: S,
+    tg: &Tg,
     sink: chan::Sender<telegram::Update>,
 ) -> eyre::Result<()> {
     let timeout = 30;
@@ -153,7 +157,7 @@ async fn update_streamer(
     loop {
         let batch = match async {
             tracing::info!(offset);
-            api.call(&client, telegram::GetUpdates { offset, timeout })
+            tg.call(&client, telegram::GetUpdates { offset, timeout })
                 .await
         }
         .await
