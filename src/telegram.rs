@@ -132,14 +132,13 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     type Error = S::Error;
-    // type Future<Q: Query + 'static> = <Instance<S> as Service<Q>>::Future;
     type Future<Q: Query + 'static> = std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Q::Response, ApiError<Self::Error>>> + Send>,
     >;
 
     fn call<Q: Query + 'static>(&self, query: Q) -> Self::Future<Q> {
         let url = method_url(&self.url, Q::ENDPOINT);
-        Box::pin(do_call(self.client.clone(), query, url))
+        Box::pin(build_call(self.client.clone(), query, url))
     }
 }
 
@@ -173,11 +172,11 @@ fn method_url(base: &Url, method: &str) -> Url {
 }
 
 #[tracing::instrument(skip(client))]
-async fn do_call<Q: Query, S: Service<Request, Response = Bytes>>(
-    mut client: S,
+fn build_call<Q: Query, S: Service<Request, Response = Bytes>>(
+    client: S,
     query: Q,
     url: Url,
-) -> Result<Q::Response, ApiError<S::Error>> {
+) -> impl std::future::Future<Output = Result<Q::Response, ApiError<S::Error>>> {
     let (body, extra_part) = query.construct();
     let body = if let Some(part) = extra_part {
         Body::Multipart(vec![
@@ -193,6 +192,27 @@ async fn do_call<Q: Query, S: Service<Request, Response = Bytes>>(
         Body::Normal(serde_json::to_string(&body).unwrap().into())
     };
 
+    let req = Request {
+        method: Method::POST,
+        url,
+        body,
+    };
+
+    use futures::FutureExt;
+
+    do_req(client, req).map(|bytes| {
+        let bytes = bytes?;
+        let resp: Reply<Q::Response> = serde_json::from_slice(&bytes).map_err(|_| {
+            ApiError::MalformedResponse(String::from_utf8_lossy(&bytes).into_owned())
+        })?;
+        resp.into_result()
+    })
+}
+
+async fn do_req<S: Service<Request, Response = Bytes>>(
+    mut client: S,
+    req: Request,
+) -> Result<Bytes, S::Error> {
     use tower::ServiceExt;
 
     let client = client
@@ -200,18 +220,10 @@ async fn do_call<Q: Query, S: Service<Request, Response = Bytes>>(
         .instrument(tracing::info_span!("awaiting client"))
         .await?;
 
-    let resp = client
-        .call(Request {
-            method: Method::POST,
-            url,
-            body,
-        })
+    client
+        .call(req)
         .instrument(tracing::info_span!("calling method"))
-        .await?;
-
-    let resp: Reply<Q::Response> = serde_json::from_slice(&resp)
-        .map_err(|_| ApiError::MalformedResponse(String::from_utf8_lossy(&resp).into_owned()))?;
-    resp.into_result()
+        .await
 }
 
 /// Represents an empty (or ignored) response. `()` doesn't work on its own
