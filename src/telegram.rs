@@ -9,6 +9,7 @@ use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tower::Service;
+use tracing::Instrument;
 
 #[derive(Debug, Error)]
 pub enum ApiError<Inner> {
@@ -114,7 +115,11 @@ async fn do_call<Q: Query, S: Service<Request, Response = Bytes>>(
     };
 
     use tower::ServiceExt;
-    let client = client.ready().await?;
+
+    let client = client
+        .ready()
+        .instrument(tracing::info_span!("awaiting client"))
+        .await?;
 
     let resp = client
         .call(Request {
@@ -122,6 +127,7 @@ async fn do_call<Q: Query, S: Service<Request, Response = Bytes>>(
             url,
             body,
         })
+        .instrument(tracing::info_span!("calling method"))
         .await?;
 
     let resp: Reply<Q::Response> = serde_json::from_slice(&resp)
@@ -302,32 +308,35 @@ mod tests {
         let api = Api::new("fake");
         let (m, mut handle) = mock::pair::<hs::Request, Bytes>();
         let task = tokio::spawn(async move {
-            let (req, h) = handle.next_request().await.unwrap();
-            ensure!(req.method == Method::POST, "incorrect method");
-            ensure!(
-                req.url == Url::parse("https://api.telegram.org/botfake/getMe").unwrap(),
-                "incorrect url"
-            );
-            let Body::Normal(bytes) = req.body else { bail!("incorrect body type: {:?}", req.body)};
-
-            use serde_json::{json, Value};
-            let value: Value = serde_json::from_slice(&bytes)?;
-            ensure!(value == json!({}), "incorrect body: {value:?}");
-            h.send_response(
-                serde_json::to_string(&User {
-                    id: 42,
-                    is_bot: true,
-                })
-                .unwrap()
-                .into(),
-            );
-            Ok(())
+            api.on(&m.map_err(|e| EyreWrapper::from(eyre!(e))))
+                .call(GetMe)
+                .await
         });
-        let resp = api
-            .on(&mut m.map_err(|e| EyreWrapper::from(eyre!(e))))
-            .call(GetMe)
-            .await?;
-        task.await??;
+
+        let (req, h) = handle.next_request().await.unwrap();
+        ensure!(req.method == Method::POST, "incorrect method");
+        ensure!(
+            req.url == Url::parse("https://api.telegram.org/botfake/getMe").unwrap(),
+            "incorrect url"
+        );
+        let Body::Normal(bytes) = req.body else { bail!("incorrect body type: {:?}", req.body)};
+
+        use serde_json::{json, Value};
+        let value: Value = serde_json::from_slice(&bytes)?;
+        ensure!(value == json!(null), "incorrect body: {value:?}");
+        h.send_response(
+            json!({
+                "ok": true,
+                "result": {
+                    "id": 42,
+                    "is_bot": true
+                }
+            })
+            .to_string()
+            .into(),
+        );
+
+        let resp = task.await??;
         ensure!(
             matches!(
                 resp,
@@ -338,6 +347,6 @@ mod tests {
             ),
             "service did not reply correctly"
         );
-        todo!()
+        Ok(())
     }
 }

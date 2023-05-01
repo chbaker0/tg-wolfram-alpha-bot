@@ -6,6 +6,7 @@
 
 use bytes::Bytes;
 use tower::Service;
+use tracing::Instrument;
 
 pub use http::method::Method;
 pub use reqwest::{Error, Result, Url};
@@ -77,7 +78,13 @@ impl Service<Request> for Client {
         let client = self.inner.clone();
         Box::pin(async move {
             let req = builder?.build()?;
-            client.execute(req).await?.bytes().await
+            client
+                .execute(req)
+                .instrument(tracing::info_span!("sending request"))
+                .await?
+                .bytes()
+                .instrument(tracing::info_span!("awaiting response"))
+                .await
         })
     }
 }

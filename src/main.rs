@@ -4,9 +4,6 @@ mod http_service;
 mod telegram;
 mod wolfram;
 
-#[cfg(test)]
-mod test_util;
-
 use std::sync::Arc;
 
 use eyre::{bail, Context};
@@ -197,3 +194,6 @@ async fn update_streamer(
 
 static TELEGRAM_KEY: &str = include_str!("../.keys/telegram");
 static WOLFRAM_KEY: &str = include_str!("../.keys/wolframalpha");
+
+#[cfg(test)]
+mod test_util;
