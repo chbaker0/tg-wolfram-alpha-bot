@@ -39,10 +39,11 @@ impl Api {
         }
     }
 
-    fn on<S: Service<Request, Response = Bytes> + Send + Clone>(&self, client: &S) -> ApiOn<S> {
+    pub fn on<S: Service<Request, Response = Bytes> + Send + Clone>(&self, client: &S) -> ApiOn<S> {
         ApiOn {
             url: self.url.clone(),
-            client: Some(client.clone()),
+            client: client.clone(),
+            // client: Some(client.clone()),
         }
     }
 }
@@ -51,15 +52,6 @@ pub trait GenericApi<S, E> {
     type Handler<Q: Query + 'static>: Service<Q>;
     type Future<Q: Query + 'static>: std::future::Future<Output = Result<Q::Response, ApiError<E>>>;
     fn call<Q: Query + 'static>(&self, client: &S, query: Q) -> Self::Future<Q>;
-}
-
-fn method_url(base: &Url, method: &str) -> Url {
-    base.join(method).unwrap()
-}
-
-pub struct ApiOn<S> {
-    url: Arc<Url>,
-    client: Option<S>,
 }
 
 impl<S> GenericApi<S, S::Error> for Api
@@ -75,9 +67,41 @@ where
     }
 }
 
+fn method_url(base: &Url, method: &str) -> Url {
+    base.join(method).unwrap()
+}
+
+pub trait GenericApiOn {
+    type Error: std::error::Error + Send + Sync + 'static;
+    type Future<Q: Query + 'static>: std::future::Future<
+        Output = Result<Q::Response, ApiError<Self::Error>>,
+    >;
+    fn do_call<Q: Query + 'static>(&self, query: Q) -> Self::Future<Q>;
+}
+
+impl<S, E> GenericApiOn for ApiOn<S>
+where
+    S: Service<Request, Response = Bytes, Error = E> + Send + Clone + 'static,
+    <S as Service<Request>>::Future: Send,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    type Error = S::Error;
+    type Future<Q: Query + 'static> = <ApiOn<S> as Service<Q>>::Future;
+
+    fn do_call<Q: Query + 'static>(&self, query: Q) -> Self::Future<Q> {
+        self.clone().call(query)
+    }
+}
+
+#[derive(Clone)]
+pub struct ApiOn<S> {
+    url: Arc<Url>,
+    client: S,
+}
+
 impl<Q: Query, S> Service<Q> for ApiOn<S>
 where
-    S: Service<Request, Response = Bytes> + Send + 'static,
+    S: Service<Request, Response = Bytes> + Send + Clone + 'static,
     S::Future: Send,
     S::Error: Send,
     Q: 'static,
@@ -92,13 +116,13 @@ where
         &mut self,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        assert!(self.client.is_some());
+        // assert!(self.client);
         std::task::Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, query: Q) -> Self::Future {
         let url = method_url(&self.url, Q::ENDPOINT);
-        Box::pin(do_call(self.client.take().unwrap(), query, url))
+        Box::pin(do_call(self.client.clone(), query, url))
     }
 }
 

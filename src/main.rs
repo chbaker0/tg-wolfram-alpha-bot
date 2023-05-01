@@ -50,7 +50,7 @@ async fn main() -> eyre::Result<()> {
     let tg_update_task = tokio::task::spawn({
         let client = client.clone();
         let tg = tg.clone();
-        async move { update_streamer(client, tg.as_ref(), sender).await }
+        async move { update_streamer(&tg.on(&client), sender).await }
     });
 
     while let Some(u) = receiver.recv().await {
@@ -58,20 +58,19 @@ async fn main() -> eyre::Result<()> {
 
         // Spawn and ignore the handle, since the task doesn't return anything and
         // logs any errors.
-        handle_request(client.clone(), tg.as_ref(), &wolf, msg).await;
+        handle_request(&tg.on(&client), &wolf, msg).await;
     }
 
     tg_update_task.await?
 }
 
-#[instrument(skip(client, tg, wolfram))]
-async fn handle_request<S, E: std::error::Error + Send + Sync + 'static, Tg: GenericApi<S, E>>(
-    client: S,
+#[instrument(skip(tg, wolfram))]
+async fn handle_request<Tg: telegram::GenericApiOn>(
     tg: &Tg,
     wolfram: &wolfram::Api,
     msg: telegram::Message,
 ) {
-    match handle_request_impl(client, tg, wolfram, &msg).await {
+    match handle_request_impl(tg, wolfram, &msg).await {
         Ok(()) => (),
         Err(report) => {
             error!(
@@ -82,12 +81,7 @@ async fn handle_request<S, E: std::error::Error + Send + Sync + 'static, Tg: Gen
     }
 }
 
-async fn handle_request_impl<
-    S,
-    E: std::error::Error + Send + Sync + 'static,
-    Tg: GenericApi<S, E>,
->(
-    client: S,
+async fn handle_request_impl<Tg: telegram::GenericApiOn>(
     tg: &Tg,
     wolfram: &wolfram::Api,
     msg: &telegram::Message,
@@ -107,14 +101,11 @@ async fn handle_request_impl<
     }
 
     let send_message = |text| {
-        tg.call(
-            &client,
-            telegram::SendMessage {
-                chat_id: msg.chat.id,
-                reply_to_message_id: msg.message_id,
-                text,
-            },
-        )
+        tg.do_call(telegram::SendMessage {
+            chat_id: msg.chat.id,
+            reply_to_message_id: msg.message_id,
+            text,
+        })
     };
 
     match wolfram.query(text.to_string()).await {
@@ -125,7 +116,7 @@ async fn handle_request_impl<
                 resp.image_data,
                 resp.content_type,
             ) {
-                tg.call(&client, q).await
+                tg.do_call(q).await
             } else {
                 send_message("Wolfram Alpha sent a bad image".to_string()).await
             }
@@ -139,8 +130,7 @@ async fn handle_request_impl<
     .wrap_err("telegram api request failed")
 }
 
-async fn update_streamer<S, E: std::error::Error + Send + Sync + 'static, Tg: GenericApi<S, E>>(
-    client: S,
+async fn update_streamer<Tg: telegram::GenericApiOn>(
     tg: &Tg,
     sink: chan::Sender<telegram::Update>,
 ) -> eyre::Result<()> {
@@ -157,8 +147,7 @@ async fn update_streamer<S, E: std::error::Error + Send + Sync + 'static, Tg: Ge
     loop {
         let batch = match async {
             tracing::info!(offset);
-            tg.call(&client, telegram::GetUpdates { offset, timeout })
-                .await
+            tg.do_call(telegram::GetUpdates { offset, timeout }).await
         }
         .await
         {
