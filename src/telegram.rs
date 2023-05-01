@@ -53,12 +53,10 @@ pub trait Query: std::fmt::Debug + Send {
 pub trait Client {
     /// The underlying service's error type.
     type Error: std::error::Error + Send + Sync + 'static;
-    type Future<Q: Query + 'static>: std::future::Future<
-        Output = Result<Q::Response, ApiError<Self::Error>>,
-    >;
+    type Future<Q: Query>: std::future::Future<Output = Result<Q::Response, ApiError<Self::Error>>>;
 
     /// Call `query` and get the result.
-    fn call<Q: Query + 'static>(&self, query: Q) -> Self::Future<Q>;
+    fn call<Q: Query>(&self, query: Q) -> Self::Future<Q>;
 }
 
 /// A Telegram bot. Constructs a `Client` instance for calling API methods.
@@ -79,9 +77,8 @@ impl Bot {
     /// send Telegram queries. `client` should be cheaply cloneable (e.g.
     /// reqwest::Client), which is a simple `Arc<_>` internally.
     ///
-    /// The returned value implements both `GenericApiOn`, to send any Telegram
-    /// query, and `tower::Service<Q>` for all query types `Q`, for interop with
-    /// tower.
+    /// The returned value implements both `Client`, to send any Telegram query,
+    /// and `tower::Service<Q>` for all query types `Q`, for interop with tower.
     pub fn on<S: Service<Request, Response = Bytes> + Send + Clone>(
         &self,
         client: S,
@@ -103,15 +100,13 @@ pub struct Instance<S> {
 
 impl<S, E> Client for Instance<S>
 where
-    S: Service<Request, Response = Bytes, Error = E> + Send + Sync + Clone + 'static,
-    S::Future: Send + Sync,
-    <S as Service<Request>>::Future: Send,
+    S: Service<Request, Response = Bytes, Error = E> + Clone,
     E: std::error::Error + Send + Sync + 'static,
 {
     type Error = S::Error;
-    type Future<Q: Query + 'static> = DoCall<S, Q::Response>;
+    type Future<Q: Query> = DoCall<S, Q::Response>;
 
-    fn call<Q: Query + 'static>(&self, query: Q) -> Self::Future<Q> {
+    fn call<Q: Query>(&self, query: Q) -> Self::Future<Q> {
         let url = method_url(&self.url, Q::ENDPOINT);
         build_call(self.client.clone(), query, url)
     }
@@ -119,10 +114,8 @@ where
 
 impl<Q: Query, S> Service<Q> for Instance<S>
 where
-    S: Service<Request, Response = Bytes> + Send + Sync + Clone + 'static,
-    S::Future: Send + Sync,
-    S::Error: Send + Sync + std::error::Error,
-    Q: 'static,
+    S: Service<Request, Response = Bytes> + Clone,
+    S::Error: Send + Sync + std::error::Error + 'static,
 {
     type Response = Q::Response;
     type Error = ApiError<S::Error>;
@@ -145,14 +138,11 @@ fn method_url(base: &Url, method: &str) -> Url {
 }
 
 #[tracing::instrument(skip(client))]
-fn build_call<Q: Query, S: Service<Request, Response = Bytes> + Send + Sync>(
+fn build_call<Q: Query, S: Service<Request, Response = Bytes>>(
     client: S,
     query: Q,
     url: Url,
-) -> DoCall<S, Q::Response>
-where
-    S::Future: Send + Sync,
-{
+) -> DoCall<S, Q::Response> {
     let (body, extra_part) = query.construct();
     let body = if let Some(part) = extra_part {
         Body::Multipart(vec![
@@ -211,13 +201,6 @@ where
             .and_then(|r: Reply<Resp>| r.into_result());
         Ready(resp)
     }
-}
-
-unsafe impl<S, Resp> Send for DoCall<S, Resp>
-where
-    S: Service<Request>,
-    S::Future: Send,
-{
 }
 
 /// Represents an empty (or ignored) response. `()` doesn't work on its own
@@ -385,7 +368,7 @@ mod tests {
         let api = Bot::new("fake");
         let (m, mut handle) = mock::pair::<hs::Request, Bytes>();
         let client = api.on(m.map_err(|e| EyreWrapper::from(eyre!(e))));
-        let task = tokio::spawn(async move { client.call(GetMe).await });
+        let task = tokio::spawn(client.call(GetMe));
 
         let (req, h) = handle.next_request().await.unwrap();
         ensure!(req.method == Method::POST, "incorrect method");
