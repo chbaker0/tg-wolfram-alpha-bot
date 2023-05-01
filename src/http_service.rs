@@ -46,7 +46,7 @@ impl Client {
 impl Service<Request> for Client {
     type Response = Bytes;
     type Error = Error;
-    type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Bytes>> + Send>>;
+    type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Bytes>> + Send + Sync>>;
 
     fn poll_ready(
         &mut self,

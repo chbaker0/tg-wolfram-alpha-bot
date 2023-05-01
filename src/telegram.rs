@@ -8,7 +8,7 @@ use bytes::Bytes;
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tower::Service;
+use tower::{Service, ServiceExt};
 use tracing::Instrument;
 
 #[derive(Debug, Error)]
@@ -33,7 +33,7 @@ pub enum ApiError<Inner> {
 /// A valid Telegram Bot API query. Consumed on use.
 pub trait Query: std::fmt::Debug + Send {
     /// The response type.
-    type Response: DeserializeOwned;
+    type Response: DeserializeOwned + Send + Sync;
 
     /// For internal use. The internal body that will be serialized to send.
     type Body: Serialize + Send;
@@ -69,18 +69,19 @@ where
     type Client: Client;
 
     /// Construct `Client` on HTTP service `service`.
-    fn on(&self, service: &S) -> Self::Client;
+    fn on(&self, service: S) -> Self::Client;
 }
 
 impl<S> ClientMaker<S> for Bot
 where
-    S: Service<Request, Response = Bytes> + Send + Clone + 'static,
+    S: Service<Request, Response = Bytes> + Send + Sync + Clone + 'static,
+    S::Future: Send + Sync,
     <S as Service<Request>>::Future: Send,
     <S as Service<Request>>::Error: Send + Sync + std::error::Error,
 {
     type Client = Instance<S>;
 
-    fn on(&self, service: &S) -> Self::Client {
+    fn on(&self, service: S) -> Self::Client {
         self.on(service)
     }
 }
@@ -108,11 +109,11 @@ impl Bot {
     /// tower.
     pub fn on<S: Service<Request, Response = Bytes> + Send + Clone>(
         &self,
-        client: &S,
+        client: S,
     ) -> Instance<S> {
         Instance {
             url: self.url.clone(),
-            client: client.clone(),
+            client,
         }
     }
 }
@@ -127,33 +128,30 @@ pub struct Instance<S> {
 
 impl<S, E> Client for Instance<S>
 where
-    S: Service<Request, Response = Bytes, Error = E> + Send + Clone + 'static,
+    S: Service<Request, Response = Bytes, Error = E> + Send + Sync + Clone + 'static,
+    S::Future: Send + Sync,
     <S as Service<Request>>::Future: Send,
     E: std::error::Error + Send + Sync + 'static,
 {
     type Error = S::Error;
-    type Future<Q: Query + 'static> = std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Q::Response, ApiError<Self::Error>>> + Send>,
-    >;
+    type Future<Q: Query + 'static> = DoCall<S, Q::Response>;
 
     fn call<Q: Query + 'static>(&self, query: Q) -> Self::Future<Q> {
         let url = method_url(&self.url, Q::ENDPOINT);
-        Box::pin(build_call(self.client.clone(), query, url))
+        build_call(self.client.clone(), query, url)
     }
 }
 
 impl<Q: Query, S> Service<Q> for Instance<S>
 where
-    S: Service<Request, Response = Bytes> + Send + Clone + 'static,
-    S::Future: Send,
+    S: Service<Request, Response = Bytes> + Send + Sync + Clone + 'static,
+    S::Future: Send + Sync,
     S::Error: Send + Sync + std::error::Error,
     Q: 'static,
 {
     type Response = Q::Response;
     type Error = ApiError<S::Error>;
-    type Future = std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
-    >;
+    type Future = DoCall<S, Q::Response>;
 
     fn poll_ready(
         &mut self,
@@ -172,11 +170,14 @@ fn method_url(base: &Url, method: &str) -> Url {
 }
 
 #[tracing::instrument(skip(client))]
-fn build_call<Q: Query, S: Service<Request, Response = Bytes>>(
+fn build_call<Q: Query, S: Service<Request, Response = Bytes> + Send + Sync>(
     client: S,
     query: Q,
     url: Url,
-) -> impl std::future::Future<Output = Result<Q::Response, ApiError<S::Error>>> {
+) -> DoCall<S, Q::Response>
+where
+    S::Future: Send + Sync,
+{
     let (body, extra_part) = query.construct();
     let body = if let Some(part) = extra_part {
         Body::Multipart(vec![
@@ -198,32 +199,50 @@ fn build_call<Q: Query, S: Service<Request, Response = Bytes>>(
         body,
     };
 
-    use futures::FutureExt;
-
-    do_req(client, req).map(|bytes| {
-        let bytes = bytes?;
-        let resp: Reply<Q::Response> = serde_json::from_slice(&bytes).map_err(|_| {
-            ApiError::MalformedResponse(String::from_utf8_lossy(&bytes).into_owned())
-        })?;
-        resp.into_result()
-    })
+    DoCall {
+        fut: client
+            .oneshot(req)
+            .instrument(tracing::trace_span!("calling method")),
+        _phantom: std::marker::PhantomData,
+    }
 }
 
-async fn do_req<S: Service<Request, Response = Bytes>>(
-    mut client: S,
-    req: Request,
-) -> Result<Bytes, S::Error> {
-    use tower::ServiceExt;
+pub struct DoCall<S: Service<Request>, Resp> {
+    fut: tracing::instrument::Instrumented<tower::util::Oneshot<S, Request>>,
+    _phantom: std::marker::PhantomData<Resp>,
+}
 
-    let client = client
-        .ready()
-        .instrument(tracing::info_span!("awaiting client"))
-        .await?;
+impl<S, Resp> std::future::Future for DoCall<S, Resp>
+where
+    S: Service<Request, Response = Bytes>,
+    Resp: DeserializeOwned,
+{
+    type Output = Result<Resp, ApiError<S::Error>>;
 
-    client
-        .call(req)
-        .instrument(tracing::info_span!("calling method"))
-        .await
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        use std::task::Poll::*;
+        let bytes: Bytes = match unsafe { self.as_mut().map_unchecked_mut(|s| &mut s.fut) }.poll(cx)
+        {
+            Ready(Ok(b)) => b,
+            Ready(Err(e)) => return Ready(Err(e.into())),
+            Pending => return Pending,
+        };
+
+        let resp: Result<Resp, _> = serde_json::from_slice(&bytes)
+            .map_err(|_| ApiError::MalformedResponse(String::from_utf8_lossy(&bytes).into_owned()))
+            .and_then(|r: Reply<Resp>| r.into_result());
+        Ready(resp)
+    }
+}
+
+unsafe impl<S, Resp> Send for DoCall<S, Resp>
+where
+    S: Service<Request>,
+    S::Future: Send,
+{
 }
 
 /// Represents an empty (or ignored) response. `()` doesn't work on its own
@@ -390,11 +409,8 @@ mod tests {
 
         let api = Bot::new("fake");
         let (m, mut handle) = mock::pair::<hs::Request, Bytes>();
-        let task = tokio::spawn(async move {
-            api.on(&m.map_err(|e| EyreWrapper::from(eyre!(e))))
-                .call(GetMe)
-                .await
-        });
+        let client = api.on(m.map_err(|e| EyreWrapper::from(eyre!(e))));
+        let task = tokio::spawn(async move { client.call(GetMe).await });
 
         let (req, h) = handle.next_request().await.unwrap();
         ensure!(req.method == Method::POST, "incorrect method");

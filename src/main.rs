@@ -39,7 +39,7 @@ async fn main() -> eyre::Result<()> {
     let wolf = Arc::new(wolfram::Api::new(reqw.clone(), WOLFRAM_KEY.trim_end()));
 
     let client = http_service::Client::new(reqw);
-    let tg = Arc::new(telegram::Bot::new(TELEGRAM_KEY.trim_end()).on(&client));
+    let tg = Arc::new(telegram::Bot::new(TELEGRAM_KEY.trim_end()).on(client.clone()));
 
     let me = tg.call(telegram::GetMe).await?;
     println!("ID: {}", me.id);
