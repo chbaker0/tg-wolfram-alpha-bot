@@ -31,12 +31,12 @@ pub enum ApiError<Inner> {
 }
 
 /// A valid Telegram Bot API query. Consumed on use.
-pub trait Query: std::fmt::Debug + Send {
+pub trait Query: std::fmt::Debug {
     /// The response type.
-    type Response: DeserializeOwned + Send + Sync;
+    type Response: DeserializeOwned;
 
     /// For internal use. The internal body that will be serialized to send.
-    type Body: Serialize + Send;
+    type Body: Serialize;
 
     /// For internal use. The endpoint URL for this query.
     const ENDPOINT: &'static str;
