@@ -4,7 +4,7 @@ mod http_service;
 mod telegram;
 mod wolfram;
 
-use telegram::GenericApi;
+use telegram::Client;
 
 use std::sync::Arc;
 
@@ -35,22 +35,20 @@ async fn main() -> eyre::Result<()> {
 
     let _guard = tokio::task::LocalSet::new().enter();
 
-    let client = reqwest::Client::new();
+    let reqw = reqwest::Client::new();
+    let wolf = Arc::new(wolfram::Api::new(reqw.clone(), WOLFRAM_KEY.trim_end()));
 
-    let tg = Arc::new(telegram::Api::new(TELEGRAM_KEY.trim_end()));
-    let wolf = Arc::new(wolfram::Api::new(client.clone(), WOLFRAM_KEY.trim_end()));
+    let client = http_service::Client::new(reqw);
+    let tg = Arc::new(telegram::Bot::new(TELEGRAM_KEY.trim_end()).on(&client));
 
-    let client = http_service::Client::new(client);
-
-    let me = tg.call(&client, telegram::GetMe).await?;
+    let me = tg.call(telegram::GetMe).await?;
     println!("ID: {}", me.id);
     eyre::ensure!(me.is_bot, "we're not a bot?");
 
     let (sender, mut receiver) = chan::channel(100);
     let tg_update_task = tokio::task::spawn({
-        let client = client.clone();
         let tg = tg.clone();
-        async move { update_streamer(&tg.on(&client), sender).await }
+        async move { update_streamer(tg.as_ref(), sender).await }
     });
 
     while let Some(u) = receiver.recv().await {
@@ -58,14 +56,14 @@ async fn main() -> eyre::Result<()> {
 
         // Spawn and ignore the handle, since the task doesn't return anything and
         // logs any errors.
-        handle_request(&tg.on(&client), &wolf, msg).await;
+        handle_request(tg.as_ref(), &wolf, msg).await;
     }
 
     tg_update_task.await?
 }
 
 #[instrument(skip(tg, wolfram))]
-async fn handle_request<Tg: telegram::GenericApiOn>(
+async fn handle_request<Tg: telegram::Client>(
     tg: &Tg,
     wolfram: &wolfram::Api,
     msg: telegram::Message,
@@ -81,7 +79,7 @@ async fn handle_request<Tg: telegram::GenericApiOn>(
     }
 }
 
-async fn handle_request_impl<Tg: telegram::GenericApiOn>(
+async fn handle_request_impl<Tg: telegram::Client>(
     tg: &Tg,
     wolfram: &wolfram::Api,
     msg: &telegram::Message,
@@ -101,7 +99,7 @@ async fn handle_request_impl<Tg: telegram::GenericApiOn>(
     }
 
     let send_message = |text| {
-        tg.do_call(telegram::SendMessage {
+        tg.call(telegram::SendMessage {
             chat_id: msg.chat.id,
             reply_to_message_id: msg.message_id,
             text,
@@ -116,7 +114,7 @@ async fn handle_request_impl<Tg: telegram::GenericApiOn>(
                 resp.image_data,
                 resp.content_type,
             ) {
-                tg.do_call(q).await
+                tg.call(q).await
             } else {
                 send_message("Wolfram Alpha sent a bad image".to_string()).await
             }
@@ -130,7 +128,7 @@ async fn handle_request_impl<Tg: telegram::GenericApiOn>(
     .wrap_err("telegram api request failed")
 }
 
-async fn update_streamer<Tg: telegram::GenericApiOn>(
+async fn update_streamer<Tg: telegram::Client>(
     tg: &Tg,
     sink: chan::Sender<telegram::Update>,
 ) -> eyre::Result<()> {
@@ -147,7 +145,7 @@ async fn update_streamer<Tg: telegram::GenericApiOn>(
     loop {
         let batch = match async {
             tracing::info!(offset);
-            tg.do_call(telegram::GetUpdates { offset, timeout }).await
+            tg.call(telegram::GetUpdates { offset, timeout }).await
         }
         .await
         {

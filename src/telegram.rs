@@ -45,69 +45,56 @@ pub trait Query: std::fmt::Debug + Send {
     fn construct(self) -> (Self::Body, Option<FormPart>);
 }
 
-/// The API session for a particular bot. This does nothing on its own.
-///
-/// An implementation knows how to construct an HTTP request for a query, send
-/// it on the underlying service, and parse the result.
-pub trait GenericApi<S, E> {
-    type Handler<Q: Query + 'static>: Service<Q>;
-    type Future<Q: Query + 'static>: std::future::Future<Output = Result<Q::Response, ApiError<E>>>;
-
-    /// Run `query` using `client` for HTTP.
-    fn call<Q: Query + 'static>(&self, client: &S, query: Q) -> Self::Future<Q>;
-}
-
-impl<S> GenericApi<S, S::Error> for Api
-where
-    S: Service<Request, Response = Bytes> + Send + Clone + 'static,
-    <S as Service<Request>>::Future: Send,
-    <S as Service<Request>>::Error: Send,
-{
-    type Handler<Q: Query + 'static> = ApiOn<S>;
-    type Future<Q: Query + 'static> = <ApiOn<S> as Service<Q>>::Future;
-    fn call<Q: Query + 'static>(&self, client: &S, query: Q) -> Self::Future<Q> {
-        self.on(client).call(query)
-    }
-}
-
-/// Generic API session. Given a query, sends it and returns a result.
+/// Telegram API client for a particular bot. Runs queries and returns the
+/// result.
 ///
 /// This is generic so code using the Telegram API can be tested easier. In
-/// practice, this will be constructed from `Api::on` with a real HTTP service.
-pub trait GenericApiOn {
+/// practice, this will be constructed from `Bot::on` with a real HTTP service.
+pub trait Client {
+    /// The underlying service's error type.
     type Error: std::error::Error + Send + Sync + 'static;
     type Future<Q: Query + 'static>: std::future::Future<
         Output = Result<Q::Response, ApiError<Self::Error>>,
     >;
 
     /// Call `query` and get the result.
-    fn do_call<Q: Query + 'static>(&self, query: Q) -> Self::Future<Q>;
+    fn call<Q: Query + 'static>(&self, query: Q) -> Self::Future<Q>;
 }
 
-impl<S, E> GenericApiOn for ApiOn<S>
+/// Client for a particular bot, without an HTTP service to back it.
+pub trait ClientMaker<S>
 where
-    S: Service<Request, Response = Bytes, Error = E> + Send + Clone + 'static,
-    <S as Service<Request>>::Future: Send,
-    E: std::error::Error + Send + Sync + 'static,
+    S: Service<Request>,
 {
-    type Error = S::Error;
-    type Future<Q: Query + 'static> = <ApiOn<S> as Service<Q>>::Future;
+    type Client: Client;
 
-    fn do_call<Q: Query + 'static>(&self, query: Q) -> Self::Future<Q> {
-        self.clone().call(query)
+    /// Construct `Client` on HTTP service `service`.
+    fn on(&self, service: &S) -> Self::Client;
+}
+
+impl<S> ClientMaker<S> for Bot
+where
+    S: Service<Request, Response = Bytes> + Send + Clone + 'static,
+    <S as Service<Request>>::Future: Send,
+    <S as Service<Request>>::Error: Send + Sync + std::error::Error,
+{
+    type Client = Instance<S>;
+
+    fn on(&self, service: &S) -> Self::Client {
+        self.on(service)
     }
 }
 
-/// Concrete API session.
+/// A Telegram bot. Constructs a `Client` instance for calling API methods.
 #[derive(Clone)]
-pub struct Api {
+pub struct Bot {
     url: Arc<Url>,
 }
 
-impl Api {
+impl Bot {
     pub fn new(bot_token: &str) -> Self {
         const API_URL: &str = "https://api.telegram.org/bot";
-        Api {
+        Bot {
             url: Arc::new(Url::parse(&format!("{API_URL}{bot_token}/")).unwrap()),
         }
     }
@@ -119,8 +106,11 @@ impl Api {
     /// The returned value implements both `GenericApiOn`, to send any Telegram
     /// query, and `tower::Service<Q>` for all query types `Q`, for interop with
     /// tower.
-    pub fn on<S: Service<Request, Response = Bytes> + Send + Clone>(&self, client: &S) -> ApiOn<S> {
-        ApiOn {
+    pub fn on<S: Service<Request, Response = Bytes> + Send + Clone>(
+        &self,
+        client: &S,
+    ) -> Instance<S> {
+        Instance {
             url: self.url.clone(),
             client: client.clone(),
         }
@@ -130,16 +120,34 @@ impl Api {
 /// Concrete API session on a particular HTTP service. Meant to be transient,
 /// since all fields are cheaply constructed and cloned.
 #[derive(Clone)]
-pub struct ApiOn<S> {
+pub struct Instance<S> {
     url: Arc<Url>,
     client: S,
 }
 
-impl<Q: Query, S> Service<Q> for ApiOn<S>
+impl<S, E> Client for Instance<S>
+where
+    S: Service<Request, Response = Bytes, Error = E> + Send + Clone + 'static,
+    <S as Service<Request>>::Future: Send,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    type Error = S::Error;
+    // type Future<Q: Query + 'static> = <Instance<S> as Service<Q>>::Future;
+    type Future<Q: Query + 'static> = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Q::Response, ApiError<Self::Error>>> + Send>,
+    >;
+
+    fn call<Q: Query + 'static>(&self, query: Q) -> Self::Future<Q> {
+        let url = method_url(&self.url, Q::ENDPOINT);
+        Box::pin(do_call(self.client.clone(), query, url))
+    }
+}
+
+impl<Q: Query, S> Service<Q> for Instance<S>
 where
     S: Service<Request, Response = Bytes> + Send + Clone + 'static,
     S::Future: Send,
-    S::Error: Send,
+    S::Error: Send + Sync + std::error::Error,
     Q: 'static,
 {
     type Response = Q::Response;
@@ -152,13 +160,11 @@ where
         &mut self,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        // assert!(self.client);
         std::task::Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, query: Q) -> Self::Future {
-        let url = method_url(&self.url, Q::ENDPOINT);
-        Box::pin(do_call(self.client.clone(), query, url))
+        <Self as Client>::call(self, query)
     }
 }
 
@@ -370,7 +376,7 @@ mod tests {
     async fn test() -> eyre::Result<()> {
         crate::setup_tracing().unwrap();
 
-        let api = Api::new("fake");
+        let api = Bot::new("fake");
         let (m, mut handle) = mock::pair::<hs::Request, Bytes>();
         let task = tokio::spawn(async move {
             api.on(&m.map_err(|e| EyreWrapper::from(eyre!(e))))
