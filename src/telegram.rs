@@ -61,31 +61,6 @@ pub trait Client {
     fn call<Q: Query + 'static>(&self, query: Q) -> Self::Future<Q>;
 }
 
-/// Client for a particular bot, without an HTTP service to back it.
-pub trait ClientMaker<S>
-where
-    S: Service<Request>,
-{
-    type Client: Client;
-
-    /// Construct `Client` on HTTP service `service`.
-    fn on(&self, service: S) -> Self::Client;
-}
-
-impl<S> ClientMaker<S> for Bot
-where
-    S: Service<Request, Response = Bytes> + Send + Sync + Clone + 'static,
-    S::Future: Send + Sync,
-    <S as Service<Request>>::Future: Send,
-    <S as Service<Request>>::Error: Send + Sync + std::error::Error,
-{
-    type Client = Instance<S>;
-
-    fn on(&self, service: S) -> Self::Client {
-        self.on(service)
-    }
-}
-
 /// A Telegram bot. Constructs a `Client` instance for calling API methods.
 #[derive(Clone)]
 pub struct Bot {
