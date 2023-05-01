@@ -52,7 +52,7 @@ pub trait Query: std::fmt::Debug {
 /// practice, this will be constructed from `Bot::on` with a real HTTP service.
 pub trait Client {
     /// The underlying service's error type.
-    type Error: std::error::Error + Send + Sync + 'static;
+    type Error;
     type Future<Q: Query>: std::future::Future<Output = Result<Q::Response, ApiError<Self::Error>>>;
 
     /// Call `query` and get the result.
@@ -101,7 +101,6 @@ pub struct Instance<S> {
 impl<S, E> Client for Instance<S>
 where
     S: Service<Request, Response = Bytes, Error = E> + Clone,
-    E: std::error::Error + Send + Sync + 'static,
 {
     type Error = S::Error;
     type Future<Q: Query> = DoCall<S, Q::Response>;
@@ -115,7 +114,6 @@ where
 impl<Q: Query, S> Service<Q> for Instance<S>
 where
     S: Service<Request, Response = Bytes> + Clone,
-    S::Error: Send + Sync + std::error::Error + 'static,
 {
     type Response = Q::Response;
     type Error = ApiError<S::Error>;

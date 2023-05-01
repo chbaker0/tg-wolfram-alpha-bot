@@ -67,7 +67,9 @@ async fn handle_request<Tg: telegram::Client>(
     tg: &Tg,
     wolfram: &wolfram::Api,
     msg: telegram::Message,
-) {
+) where
+    Tg::Error: std::error::Error + Send + Sync + 'static,
+{
     match handle_request_impl(tg, wolfram, &msg).await {
         Ok(()) => (),
         Err(report) => {
@@ -83,7 +85,10 @@ async fn handle_request_impl<Tg: telegram::Client>(
     tg: &Tg,
     wolfram: &wolfram::Api,
     msg: &telegram::Message,
-) -> eyre::Result<()> {
+) -> eyre::Result<()>
+where
+    Tg::Error: std::error::Error + Send + Sync + 'static,
+{
     tracing::info!(msg.text);
     let Some(mut text) = msg.text.as_deref() else {return Ok(())};
 
@@ -131,7 +136,10 @@ async fn handle_request_impl<Tg: telegram::Client>(
 async fn update_streamer<Tg: telegram::Client>(
     tg: &Tg,
     sink: chan::Sender<telegram::Update>,
-) -> eyre::Result<()> {
+) -> eyre::Result<()>
+where
+    Tg::Error: std::error::Error + Send + Sync + 'static,
+{
     let timeout = 30;
 
     // Keep track of the number of consecutive failed requests. Retry until
