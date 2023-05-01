@@ -79,7 +79,7 @@ impl Bot {
     ///
     /// The returned value implements both `Client`, to send any Telegram query,
     /// and `tower::Service<Q>` for all query types `Q`, for interop with tower.
-    pub fn on<S: Service<Request, Response = Bytes> + Send + Clone>(
+    pub fn on<S: Service<Request, Response = Bytes> + Clone>(
         &self,
         client: S,
     ) -> Instance<S> {
