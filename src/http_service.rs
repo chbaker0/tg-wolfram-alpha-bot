@@ -12,20 +12,20 @@ pub use http::method::Method;
 pub use http::HeaderMap;
 pub use reqwest::{Error, Result, Url};
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Request {
     pub method: Method,
     pub url: Url,
     pub body: Body,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Body {
     Normal(Bytes),
     Multipart(Vec<FormPart>),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct FormPart {
     pub name: String,
     pub file_name: Option<String>,

@@ -53,7 +53,7 @@ async fn main() -> eyre::Result<()> {
     let (sender, mut receiver) = chan::channel(100);
     let tg_update_task = tokio::task::spawn({
         let tg = tg.clone();
-        async move { update_streamer(tg.as_ref(), sender).await }
+        async move { update_streamer(tg.as_ref(), tokio_util::sync::PollSender::new(sender)).await }
     });
 
     while let Some(u) = receiver.recv().await {
@@ -141,40 +141,52 @@ where
     .wrap_err("telegram api request failed")
 }
 
-fn update_stream<'a, S>(
-    mut tg: S,
-) -> impl futures::Stream<Item = Result<telegram::Update, S::Error>> + 'a
-where
-    S: Service<telegram::GetUpdates, Response = Vec<telegram::Update>> + 'a,
-    S::Future: 'a,
-{
-    let timeout = 30;
-
-    futures::stream::unfold(None, move |offset| {
-        tg.call(telegram::GetUpdates { offset, timeout })
-            .map(move |res| {
-                let next_offset = match &res {
-                    Ok(batch) => batch.iter().map(|u| u.update_id + 1).max(),
-                    Err(_) => offset,
-                };
-
-                Some((res, next_offset))
-            })
-    })
-    .map(|res| futures::stream::iter(std::iter::once(res).flatten_ok()))
-    .flatten()
-}
-
-async fn update_streamer<'a, E, S>(tg: S, sink: chan::Sender<telegram::Update>) -> eyre::Result<()>
+async fn update_streamer<E, S, Sink>(tg: S, sink: Sink) -> eyre::Result<()>
 where
     S: Service<
             telegram::GetUpdates,
             Response = Vec<telegram::Update>,
             Error = telegram::ApiError<E>,
-        > + 'a,
-    S::Future: 'a,
+        > + Send
+        + Sync
+        + Clone,
+    S::Future: Send,
     E: std::error::Error + Send + Sync + 'static,
+    Sink: futures::Sink<telegram::Update> + Send + Unpin,
+    Sink::Error: std::error::Error + Send + Sync + 'static,
 {
+    let wrapped = tower::service_fn(|req: telegram::GetUpdates| {
+        let mut tg = tg.clone();
+        async move {
+            loop {
+                match tg.call(req.clone()).await {
+                    Ok(u) => {
+                        return Ok(u);
+                    }
+                    Err(telegram::ApiError::RetryAfter(d)) => {
+                        tokio::time::sleep(d).await;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        .instrument(tracing::info_span!("while inspecting GetUpdates query"))
+    });
+
+    update_streamer_impl(wrapped, sink).await
+}
+
+async fn update_streamer_impl<S, Sink>(tg: S, mut sink: Sink) -> eyre::Result<()>
+where
+    S: Service<telegram::GetUpdates, Response = Vec<telegram::Update>> + Send,
+    S::Error: std::error::Error + Send + Sync + 'static,
+    S::Future: Send,
+    Sink: futures::Sink<telegram::Update> + Send + Unpin,
+    Sink::Error: std::error::Error + Send + Sync + 'static,
+{
+    use futures::SinkExt;
+
     // Keep track of the number of consecutive failed requests. Retry until
     // max_errs.
     let max_errs = 3;
@@ -191,13 +203,6 @@ where
                 Ok(u) => {
                     err_count = 0;
                     sink.send(u).await?;
-                    Ok(())
-                }
-                Err(telegram::ApiError::RetryAfter(d)) => {
-                    // Don't count this as an error. Telegram gave us a well-formed
-                    // response asking us to wait.
-                    err_count = 0;
-                    tokio::time::sleep(d).await;
                     Ok(())
                 }
                 Err(e) => {
@@ -219,8 +224,83 @@ where
     }
 }
 
+fn update_stream<'a, S>(
+    mut tg: S,
+) -> impl futures::Stream<Item = Result<telegram::Update, S::Error>> + Send + 'a
+where
+    S: Service<telegram::GetUpdates, Response = Vec<telegram::Update>> + Send + 'a,
+    S::Error: std::error::Error + Send + Sync + 'static,
+    S::Future: Send + 'a,
+{
+    let timeout = 30;
+
+    futures::stream::unfold(None, move |offset| {
+        tg.call(telegram::GetUpdates { offset, timeout })
+            .map(move |res| {
+                let next_offset = match &res {
+                    Ok(batch) => batch.iter().map(|u| u.update_id + 1).max(),
+                    Err(_) => offset,
+                };
+
+                Some((res, next_offset))
+            })
+    })
+    .map(|res| futures::stream::iter(std::iter::once(res).flatten_ok()))
+    .flatten()
+}
+
 static TELEGRAM_KEY: &str = include_str!("../.keys/telegram");
 static WOLFRAM_KEY: &str = include_str!("../.keys/wolframalpha");
 
 #[cfg(test)]
 mod test_util;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::test_util::*;
+
+    use std::future::Future;
+
+    use eyre::*;
+    use tower_test::*;
+
+    #[tokio::test]
+    async fn test_consecutive_updates() -> eyre::Result<()> {
+        crate::setup_tracing().unwrap();
+
+        use telegram::{GetUpdates, Update};
+
+        let (svc, mut controller) = mock::pair::<GetUpdates, Vec<Update>>();
+
+        fn receive_all(
+            svc: mock::Mock<GetUpdates, Vec<Update>>,
+        ) -> impl Future<Output = Vec<Update>> + Send {
+            async {
+                let svc = svc.map_err(EyreWrapper::from_boxed_error);
+                let mut received = Vec::new();
+                update_streamer_impl(svc, &mut received).await.unwrap();
+                received
+            }
+        }
+
+        let task = tokio::spawn(receive_all(svc));
+
+        let (req, h) = controller.next_request().await.unwrap();
+        ensure!(
+            matches!(
+                req,
+                GetUpdates {
+                    offset: None,
+                    timeout: _
+                }
+            ),
+            "first offset must be None"
+        );
+
+        let _updates = task.await?;
+
+        Ok(())
+    }
+}

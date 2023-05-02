@@ -31,7 +31,7 @@ pub enum ApiError<Inner> {
 }
 
 /// A valid Telegram Bot API query. Consumed on use.
-pub trait Query: std::fmt::Debug {
+pub trait Query: Clone + std::fmt::Debug {
     /// The response type.
     type Response: DeserializeOwned;
 
@@ -262,12 +262,12 @@ macro_rules! default_query_impl {
     };
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct GetMe;
 
 default_query_impl!(GetMe, User, "getMe");
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct GetUpdates {
     pub offset: Option<i64>,
     pub timeout: u64,
@@ -275,7 +275,7 @@ pub struct GetUpdates {
 
 default_query_impl!(GetUpdates, Vec<Update>, "getUpdates");
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct SendMessage {
     pub chat_id: i64,
     pub text: String,
@@ -284,7 +284,7 @@ pub struct SendMessage {
 
 default_query_impl!(SendMessage, Empty, "sendMessage");
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SendPhoto {
     body: SendPhotoBody,
     part: FormPart,
@@ -324,7 +324,7 @@ impl Query for SendPhoto {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct SendPhotoBody {
     chat_id: i64,
     photo: String,
