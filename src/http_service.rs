@@ -9,6 +9,7 @@ use tower::Service;
 use tracing::Instrument;
 
 pub use http::method::Method;
+pub use http::HeaderMap;
 pub use reqwest::{Error, Result, Url};
 
 #[derive(Debug)]
@@ -32,6 +33,13 @@ pub struct FormPart {
     pub value: Bytes,
 }
 
+#[derive(Debug)]
+pub struct Response {
+    pub status: reqwest::StatusCode,
+    pub bytes: Bytes,
+    pub headers: HeaderMap,
+}
+
 #[derive(Clone)]
 pub struct Client {
     inner: reqwest::Client,
@@ -44,9 +52,10 @@ impl Client {
 }
 
 impl Service<Request> for Client {
-    type Response = Bytes;
+    type Response = Response;
     type Error = Error;
-    type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Bytes>> + Send + Sync>>;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response>> + Send + Sync>>;
 
     fn poll_ready(
         &mut self,
@@ -61,9 +70,10 @@ impl Service<Request> for Client {
 }
 
 impl<'a> Service<Request> for &'a Client {
-    type Response = Bytes;
+    type Response = Response;
     type Error = Error;
-    type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Bytes>> + Send + Sync>>;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response>> + Send + Sync>>;
 
     fn poll_ready(
         &mut self,
@@ -93,15 +103,20 @@ impl<'a> Service<Request> for &'a Client {
             })
         })();
         let client = self.inner.clone();
+        let req = builder.and_then(|b| b.build());
         Box::pin(async move {
-            let req = builder?.build()?;
-            client
-                .execute(req)
+            let mut resp = client
+                .execute(req?)
                 .instrument(tracing::info_span!("sending request"))
-                .await?
-                .bytes()
-                .instrument(tracing::info_span!("awaiting response"))
-                .await
+                .await?;
+            Ok(Response {
+                status: resp.status(),
+                headers: std::mem::replace(resp.headers_mut(), HeaderMap::new()),
+                bytes: resp
+                    .bytes()
+                    .instrument(tracing::info_span!("awaiting response"))
+                    .await?,
+            })
         })
     }
 }

@@ -5,11 +5,17 @@ mod telegram;
 mod wolfram;
 
 use telegram::Client;
+use tracing::Instrument;
 
 use std::sync::Arc;
 
 use eyre::{bail, Context};
-// use tower::Service;
+use futures::FutureExt;
+use futures::StreamExt;
+use futures::TryStreamExt;
+use itertools::Itertools;
+use tower::util::ServiceExt;
+use tower::Service;
 use tracing::{error, instrument};
 
 use tokio::sync::mpsc as chan;
@@ -35,11 +41,10 @@ async fn main() -> eyre::Result<()> {
 
     let _guard = tokio::task::LocalSet::new().enter();
 
-    let reqw = reqwest::Client::new();
-    let wolf = Arc::new(wolfram::Api::new(reqw.clone(), WOLFRAM_KEY.trim_end()));
-
-    let client = http_service::Client::new(reqw);
-    let tg = Arc::new(telegram::Bot::new(TELEGRAM_KEY.trim_end()).on(client.clone()));
+    let client = http_service::Client::new(reqwest::Client::new());
+    let wolf = Arc::new(wolfram::Api::new(client.clone(), WOLFRAM_KEY.trim_end()));
+    let tg =
+        Arc::new(telegram::Bot::new(TELEGRAM_KEY.trim_end()).on(client.map_response(|r| r.bytes)));
 
     let me = tg.call(telegram::GetMe).await?;
     println!("ID: {}", me.id);
@@ -56,19 +61,19 @@ async fn main() -> eyre::Result<()> {
 
         // Spawn and ignore the handle, since the task doesn't return anything and
         // logs any errors.
-        handle_request(tg.as_ref(), &wolf, msg).await;
+        handle_request(tg.as_ref(), wolf.as_ref(), msg).await;
     }
 
     tg_update_task.await?
 }
 
 #[instrument(skip(tg, wolfram))]
-async fn handle_request<Tg: telegram::Client>(
-    tg: &Tg,
-    wolfram: &wolfram::Api,
-    msg: telegram::Message,
-) where
+async fn handle_request<E, Tg, Wolf>(tg: &Tg, wolfram: Wolf, msg: telegram::Message)
+where
+    Tg: telegram::Client,
     Tg::Error: std::error::Error + Send + Sync + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+    Wolf: Service<String, Response = wolfram::SimpleResponse, Error = wolfram::ApiError<E>>,
 {
     match handle_request_impl(tg, wolfram, &msg).await {
         Ok(()) => (),
@@ -81,13 +86,16 @@ async fn handle_request<Tg: telegram::Client>(
     }
 }
 
-async fn handle_request_impl<Tg: telegram::Client>(
+async fn handle_request_impl<E, Tg, Wolf>(
     tg: &Tg,
-    wolfram: &wolfram::Api,
+    mut wolfram: Wolf,
     msg: &telegram::Message,
 ) -> eyre::Result<()>
 where
+    Tg: telegram::Client,
     Tg::Error: std::error::Error + Send + Sync + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+    Wolf: Service<String, Response = wolfram::SimpleResponse, Error = wolfram::ApiError<E>>,
 {
     tracing::info!(msg.text);
     let Some(mut text) = msg.text.as_deref() else {return Ok(())};
@@ -111,7 +119,7 @@ where
         })
     };
 
-    match wolfram.query(text.to_string()).await {
+    match wolfram.call(text.to_string()).await {
         Ok(resp) => {
             if let Some(q) = telegram::SendPhoto::new(
                 msg.chat.id,
@@ -133,63 +141,81 @@ where
     .wrap_err("telegram api request failed")
 }
 
-async fn update_streamer<Tg: telegram::Client>(
-    tg: &Tg,
-    sink: chan::Sender<telegram::Update>,
-) -> eyre::Result<()>
+fn update_stream<'a, S>(
+    mut tg: S,
+) -> impl futures::Stream<Item = Result<telegram::Update, S::Error>> + 'a
 where
-    Tg::Error: std::error::Error + Send + Sync + 'static,
+    S: Service<telegram::GetUpdates, Response = Vec<telegram::Update>> + 'a,
+    S::Future: 'a,
 {
     let timeout = 30;
 
+    futures::stream::unfold(None, move |offset| {
+        tg.call(telegram::GetUpdates { offset, timeout })
+            .map(move |res| {
+                let next_offset = match &res {
+                    Ok(batch) => batch.iter().map(|u| u.update_id + 1).max(),
+                    Err(_) => offset,
+                };
+
+                Some((res, next_offset))
+            })
+    })
+    .map(|res| futures::stream::iter(std::iter::once(res).flatten_ok()))
+    .flatten()
+}
+
+async fn update_streamer<'a, E, S>(tg: S, sink: chan::Sender<telegram::Update>) -> eyre::Result<()>
+where
+    S: Service<
+            telegram::GetUpdates,
+            Response = Vec<telegram::Update>,
+            Error = telegram::ApiError<E>,
+        > + 'a,
+    S::Future: 'a,
+    E: std::error::Error + Send + Sync + 'static,
+{
     // Keep track of the number of consecutive failed requests. Retry until
     // max_errs.
     let max_errs = 3;
     let mut err_count = 0;
 
-    // The first getUpdates call technically should have no `offset` arg.
-    let mut offset = None;
+    let stream = update_stream(tg);
+    futures::pin_mut!(stream);
 
     loop {
-        let batch = match async {
-            tracing::info!(offset);
-            tg.call(telegram::GetUpdates { offset, timeout }).await
-        }
-        .await
-        {
-            Ok(b) => {
-                err_count = 0;
-                b
-            }
-            Err(telegram::ApiError::RetryAfter(d)) => {
-                // Don't count this as an error. Telegram gave us a well-formed
-                // response asking us to wait.
-                err_count = 0;
-                tokio::time::sleep(d).await;
-                continue;
-            }
-            Err(e) => {
-                // Got an error that can't be handled. Log an retry, until the
-                // max number of errors.
-                error!(e = ?e, "Telegram API error");
-                err_count += 1;
-                if err_count == max_errs {
-                    error!("Reached max number of retries");
-                    bail!(e);
+        async {
+            let u = stream.next().await.unwrap();
+
+            match u {
+                Ok(u) => {
+                    err_count = 0;
+                    sink.send(u).await?;
+                    Ok(())
                 }
-                continue;
+                Err(telegram::ApiError::RetryAfter(d)) => {
+                    // Don't count this as an error. Telegram gave us a well-formed
+                    // response asking us to wait.
+                    err_count = 0;
+                    tokio::time::sleep(d).await;
+                    Ok(())
+                }
+                Err(e) => {
+                    // Got an error that can't be handled. Log an retry, until the
+                    // max number of errors.
+                    error!(e = ?e, "Telegram API error");
+                    err_count += 1;
+                    if err_count == max_errs {
+                        error!("Reached max number of retries");
+                        Err(eyre::eyre!(e))
+                    } else {
+                        Ok(())
+                    }
+                }
             }
-        };
-
-        for u in batch.into_iter() {
-            // Bump the offset we call getUpdates with. This implicitly
-            // acknowledges the updates received upon the next call.
-            // Conveniently, `None` compares less than `Some(_)`.
-            offset = std::cmp::max(offset, Some(u.update_id + 1));
-            tracing::info!(offset, u = ?u);
-
-            sink.send(u).await?;
         }
+        .instrument(tracing::info_span!("processing update"))
+        .await?
     }
 }
 
