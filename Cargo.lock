@@ -395,6 +395,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76d3d132be6c0e6aa1534069c705a74a5997a356c0dc2f86a47765e5617c5b65"
 
 [[package]]
+name = "futures-test"
+version = "0.3.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84af27744870a4a325fa342ce65a940dfba08957b260b790ec278c1d81490349"
+dependencies = [
+ "futures-core",
+ "futures-executor",
+ "futures-io",
+ "futures-macro",
+ "futures-sink",
+ "futures-task",
+ "futures-util",
+ "pin-project",
+ "pin-utils",
+]
+
+[[package]]
 name = "futures-util"
 version = "0.3.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1500,6 +1517,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-futures"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97d095ae15e245a057c8e8451bab9b3ee1e1f68e9ba2b4fbc18d0ac5237835f2"
+dependencies = [
+ "futures",
+ "futures-task",
+ "pin-project",
+ "tracing",
+]
+
+[[package]]
 name = "tracing-log"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1946,9 +1975,11 @@ dependencies = [
  "color-eyre",
  "eyre",
  "futures",
+ "futures-test",
  "http",
  "itertools",
  "once_cell",
+ "pin-project",
  "regex",
  "reqwest",
  "serde",
@@ -1961,6 +1992,7 @@ dependencies = [
  "tower-test",
  "tracing",
  "tracing-error",
+ "tracing-futures",
  "tracing-subscriber 0.3.16",
  "tracing-test",
 ]

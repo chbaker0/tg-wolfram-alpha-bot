@@ -224,25 +224,25 @@ where
 #[derive(Deserialize)]
 pub struct Empty(IgnoredAny);
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct Update {
     pub update_id: i64,
     pub message: Option<Message>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct Message {
     pub message_id: i64,
     pub text: Option<String>,
     pub chat: Chat,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct Chat {
     pub id: i64,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct User {
     pub id: i64,
     pub is_bot: bool,
@@ -378,7 +378,7 @@ mod tests {
 
     #[tokio::test]
     async fn test() -> eyre::Result<()> {
-        crate::setup_tracing().unwrap();
+        crate::setup_tracing();
 
         let api = Bot::new("fake");
         let (m, mut handle) = mock::pair::<hs::Request, Bytes>();
