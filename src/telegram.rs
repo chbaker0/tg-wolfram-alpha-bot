@@ -126,7 +126,7 @@ where
     }
 
     fn call(&mut self, query: Q) -> Self::Future {
-        build_call(self.client.clone(), query, (*self.url).clone())
+        <Self as Client>::call(self, query)
     }
 }
 
@@ -138,21 +138,18 @@ fn method_url(base: &Url, method: &str) -> Url {
 fn build_call<Q: Query, S: Service<Request, Response = Bytes>>(
     client: S,
     query: Q,
-    url: Url,
+    mut url: Url,
 ) -> DoCall<S, Q::Response> {
     let (body, extra_part) = query.construct();
+    body.serialize(serde_urlencoded::Serializer::new(
+        &mut url.query_pairs_mut(),
+    ))
+    .unwrap();
+
     let body = if let Some(part) = extra_part {
-        Body::Multipart(vec![
-            FormPart {
-                name: "tg_query".to_string(),
-                file_name: None,
-                mime_str: Some("application/x-www-form-urlencoded".to_string()),
-                value: serde_urlencoded::to_string(&body).unwrap().into(),
-            },
-            part,
-        ])
+        Body::Multipart(vec![part])
     } else {
-        Body::Normal(serde_json::to_string(&body).unwrap().into())
+        Body::Normal(Bytes::new())
     };
 
     let req = Request {
@@ -388,13 +385,19 @@ mod tests {
         let (req, h) = handle.next_request().await.unwrap();
         ensure!(req.method == Method::POST, "incorrect method");
         ensure!(
-            req.url == Url::parse("https://api.telegram.org/botfake/getMe").unwrap(),
-            "incorrect url"
+            req.url.path() == "/botfake/getMe",
+            "incorrect url {}",
+            req.url.path()
         );
         let Body::Normal(bytes) = req.body else { bail!("incorrect body type: {:?}", req.body)};
+        ensure!(bytes.is_empty(), "{bytes:?}");
 
-        let value: Value = serde_json::from_slice(&bytes)?;
-        ensure!(value == json!(null), "incorrect body: {value:?}");
+        let value = Value::deserialize(serde_urlencoded::Deserializer::new(req.url.query_pairs()))?;
+        ensure!(
+            value == json!({}),
+            "incorrect query: {value:?} from {}",
+            req.url
+        );
         h.send_response(
             json!({
                 "ok": true,

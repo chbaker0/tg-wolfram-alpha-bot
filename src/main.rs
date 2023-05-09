@@ -8,7 +8,6 @@ mod wolfram;
 use futures::Future;
 use telegram::Client;
 
-
 use std::sync::Arc;
 
 use eyre::WrapErr;
@@ -168,10 +167,11 @@ async fn update_task<T, S, EFn, ContFut, E1, E2>(
     mut inspect_err: EFn,
 ) -> eyre::Result<()>
 where
+    T: std::fmt::Debug,
     S: Service<telegram::GetUpdates, Response = Vec<telegram::Update<T>>, Error = E1>,
     EFn: FnMut(E1) -> Result<ContFut, E2>,
     ContFut: Future<Output = ()>,
-    eyre::Report: From<E2>,
+    E2: std::error::Error + Send + Sync + 'static,
 {
     let timeout = 30;
     let mut cur_offset = None;
@@ -195,6 +195,7 @@ where
         cur_offset = batch.iter().map(|u| u.update_id + 1).max().or(cur_offset);
 
         for u in batch {
+            tracing::info!("{cur_offset:?} {u:?}");
             if chan.send(u).await.is_err() {
                 // Receiver was closed, so we may quit gracefully.
                 return Ok(());
@@ -216,14 +217,13 @@ mod tests {
     use crate::test_util::*;
 
     use eyre::{ensure, eyre};
-    
+
     use futures::FutureExt;
     use tokio::select;
-    
+
     use tokio::task::JoinHandle;
-    
+
     use tower_test::*;
-    
 
     #[tokio::test]
     async fn update_batches() -> eyre::Result<()> {
@@ -232,7 +232,7 @@ mod tests {
         use telegram::{GetUpdates, Update};
 
         let (svc, mut controller) = mock::pair::<GetUpdates, Vec<Update<()>>>();
-        let svc = svc.map_err(|e| eyre!(e));
+        let svc = svc.map_err(|e| EyreWrapper::from(eyre!(e)));
 
         let (send, mut recv) = mpsc::channel(100);
         let mut task_handle = tokio::spawn(update_task(svc, send, |e| {
