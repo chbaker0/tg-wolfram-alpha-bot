@@ -1,26 +1,23 @@
 #![feature(assert_matches)]
+#![feature(never_type)]
 
 mod http_service;
 mod telegram;
-mod util;
 mod wolfram;
 
 use futures::Future;
-use futures::TryStreamExt;
 use telegram::Client;
+
 
 use std::sync::Arc;
 
-use eyre::Context;
-use futures::FutureExt;
-use futures::StreamExt;
-use itertools::Itertools;
+use eyre::WrapErr;
 use tower::util::ServiceExt;
 use tower::Service;
 use tracing::{error, instrument};
 use tracing_futures::Instrument;
 
-use tokio::sync::mpsc as chan;
+use tokio::sync::mpsc;
 
 fn setup_tracing() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -51,14 +48,33 @@ async fn main() -> eyre::Result<()> {
     println!("ID: {}", me.id);
     eyre::ensure!(me.is_bot, "we're not a bot?");
 
-    let (sender, mut receiver) = chan::channel(100);
-    let tg_update_task = tokio::task::spawn({
-        let tg = tg.clone();
-        async move { update_streamer(tg, tokio_util::sync::PollSender::new(sender)).await }
-    });
+    let (sender, mut receiver) = mpsc::channel(100);
+
+    const MAX_API_ERRORS: u32 = 3;
+    let mut err_count = 0;
+    let tg_update_task = tokio::task::spawn(update_task(
+        tg.clone(),
+        sender,
+        move |err: telegram::ApiError<_>| {
+            use telegram::ApiError::*;
+            let wait_dur = match err {
+                RetryAfter(dur) => dur,
+                e => {
+                    if err_count == MAX_API_ERRORS {
+                        return Err(e);
+                    }
+
+                    err_count += 1;
+                    std::time::Duration::from_secs(5)
+                }
+            };
+
+            Ok(tokio::time::sleep(wait_dur))
+        },
+    ));
 
     while let Some(u) = receiver.recv().await {
-        let Some(msg) = u.message else {continue};
+        let Some(telegram::UpdateDetail::Message(msg)) = u.detail else {continue};
 
         // Spawn and ignore the handle, since the task doesn't return anything and
         // logs any errors.
@@ -73,7 +89,7 @@ async fn handle_request<E, Tg, Wolf>(tg: &Tg, wolfram: Wolf, msg: telegram::Mess
 where
     Tg: telegram::Client,
     Tg::Error: std::error::Error + Send + Sync + 'static,
-    E: std::error::Error + Send + Sync + 'static,
+    eyre::Report: From<E>,
     Wolf: Service<String, Response = wolfram::SimpleResponse, Error = wolfram::ApiError<E>>,
 {
     match handle_request_impl(tg, wolfram, &msg).await {
@@ -95,7 +111,7 @@ async fn handle_request_impl<E, Tg, Wolf>(
 where
     Tg: telegram::Client,
     Tg::Error: std::error::Error + Send + Sync + 'static,
-    E: std::error::Error + Send + Sync + 'static,
+    eyre::Report: From<E>,
     Wolf: Service<String, Response = wolfram::SimpleResponse, Error = wolfram::ApiError<E>>,
 {
     tracing::info!(msg.text);
@@ -142,179 +158,48 @@ where
     .wrap_err("telegram api request failed")
 }
 
-async fn update_streamer<E, S, Sink>(tg: S, sink: Sink) -> eyre::Result<()>
+/// Gets Telegram API updates by calling `svc` and forwards them on `chan`. When
+/// the API returns an error, `inspect_err` is called. If `Ok(fut)`, the
+/// returned future is awaited (e.g. to allow retrying after some time) then the
+/// task continues. Otherwise, the task quits with the returned error.
+async fn update_task<T, S, EFn, ContFut, E1, E2>(
+    mut svc: S,
+    chan: tokio::sync::mpsc::Sender<telegram::Update<T>>,
+    mut inspect_err: EFn,
+) -> eyre::Result<()>
 where
-    S: Service<
-            telegram::GetUpdates,
-            Response = Vec<telegram::Update>,
-            Error = telegram::ApiError<E>,
-        > + Clone,
-    E: std::error::Error + Send + Sync + 'static,
-    Sink: futures::Sink<telegram::Update> + Unpin,
-    Sink::Error: std::error::Error + Send + Sync + 'static,
+    S: Service<telegram::GetUpdates, Response = Vec<telegram::Update<T>>, Error = E1>,
+    EFn: FnMut(E1) -> Result<ContFut, E2>,
+    ContFut: Future<Output = ()>,
+    eyre::Report: From<E2>,
 {
-    let wrapped = tower::service_fn(|req: telegram::GetUpdates| {
-        let mut tg = tg.clone();
-        async move {
-            loop {
-                match (&mut tg).oneshot(req.clone()).await {
-                    Ok(u) => {
-                        return Ok(u);
-                    }
-                    Err(telegram::ApiError::RetryAfter(d)) => {
-                        tokio::time::sleep(d).await;
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-        }
-        .instrument(tracing::info_span!("while inspecting GetUpdates query"))
-    });
+    let timeout = 30;
+    let mut cur_offset = None;
 
-    let mut recorded_err: Option<eyre::Report> = None;
-
-    let max_errs = 3;
-    let mut err_count = 0;
-    let err_handler = |e: S::Error| {
-        // Got an error that can't be handled. Log an retry, until the
-        // max number of errors.
-        error!(e = ?e, "Telegram API error");
-        err_count += 1;
-        if err_count == max_errs {
-            error!("Reached max number of retries");
-            recorded_err = Some(e.into());
-            false
-        } else {
-            true
-        }
-    };
-
-    update_streamer_impl(wrapped, err_handler, sink).await;
-
-    if let Some(e) = recorded_err {
-        Err(e)
-    } else {
-        Ok(())
-    }
-}
-
-async fn update_streamer_impl<S, H, E, Sink>(svc: S, mut err_handler: H, mut sink: Sink)
-where
-    S: Service<telegram::GetUpdates, Response = Vec<telegram::Update>, Error = E> + Clone,
-    H: FnMut(E) -> bool,
-    Sink: futures::Sink<telegram::Update> + Unpin,
-{
-    use futures::SinkExt;
-
-    // Keep track of the number of consecutive failed requests. Retry until
-    // max_errs.
-    let max_errs = 3;
-    let mut err_count = 0;
-
-    let stream = util::stream_flatten_ok(UpdateBatchStream::new(svc));
-    futures::pin_mut!(stream);
-
-    async {
-        loop {
-            let u = stream.next().await.unwrap();
-
-            match u {
-                Ok(u) => {
-                    err_count = 0;
-                    if let Err(_) = sink.send(u).await {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    if !err_handler(e) {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    .instrument(tracing::info_span!("processing update"))
-    .await
-}
-
-#[pin_project::pin_project]
-struct UpdateBatchStream<S: Service<telegram::GetUpdates>> {
-    svc: S,
-    next_offset: Option<i64>,
-    #[pin]
-    call_fut: Option<S::Future>,
-}
-
-impl<S: Service<telegram::GetUpdates>> UpdateBatchStream<S> {
-    fn new(svc: S) -> Self {
-        UpdateBatchStream {
-            svc,
-            next_offset: None,
-            call_fut: None,
-        }
-    }
-
-    fn do_call(
-        req: telegram::GetUpdates,
-        svc: &mut S,
-        mut fut_place: std::pin::Pin<&mut Option<S::Future>>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<S::Response, S::Error>> {
-        use std::task::ready;
-        use std::task::Poll::*;
-
-        if fut_place.as_ref().as_pin_ref().is_none() {
-            // Must poll the service before attempting to call.
-            match ready!(svc.poll_ready(cx)) {
-                Ok(()) => (),
-                Err(e) => return Ready(Err(e)),
-            }
-
-            fut_place.set(Some(svc.call(req)));
-        }
-
-        fut_place.as_pin_mut().unwrap().poll(cx)
-    }
-}
-
-impl<S> futures::Stream for UpdateBatchStream<S>
-where
-    S: Service<telegram::GetUpdates, Response = Vec<telegram::Update>>,
-{
-    type Item = Result<Vec<telegram::Update>, S::Error>;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        use std::task::ready;
-        use std::task::Poll::*;
-
-        let mut this = self.project();
-
-        let batch = match ready!(Self::do_call(
-            telegram::GetUpdates {
-                offset: *this.next_offset,
-                timeout: 30,
-            },
-            this.svc,
-            this.call_fut.as_mut(),
-            cx
-        )) {
+    loop {
+        let batch = match (&mut svc)
+            .oneshot(telegram::GetUpdates {
+                offset: cur_offset,
+                timeout,
+            })
+            .instrument(tracing::info_span!("getting next batch of updates"))
+            .await
+        {
             Ok(b) => b,
-            Err(e) => return Ready(Some(Err(e))),
+            Err(e) => {
+                inspect_err(e)?.await;
+                continue;
+            }
         };
 
-        // Compute the new offset. This should work even if the batch is
-        // empty.
-        *this.next_offset = batch
-            .iter()
-            .map(|u| u.update_id + 1)
-            .chain(*this.next_offset)
-            .max();
+        cur_offset = batch.iter().map(|u| u.update_id + 1).max().or(cur_offset);
 
-        Ready(Some(Ok(batch)))
+        for u in batch {
+            if chan.send(u).await.is_err() {
+                // Receiver was closed, so we may quit gracefully.
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -330,103 +215,130 @@ mod tests {
 
     use crate::test_util::*;
 
-    use std::future::Future;
-
-    use eyre::*;
-    use futures::{FutureExt, SinkExt, TryFutureExt};
-    use tokio::sync;
-    use tokio::try_join;
-    use tokio_util::sync::PollSender;
+    use eyre::{ensure, eyre};
+    
+    use futures::FutureExt;
+    use tokio::select;
+    
+    use tokio::task::JoinHandle;
+    
     use tower_test::*;
-    use tracing::error_span;
+    
 
     #[tokio::test]
-    async fn test_update_batches() -> eyre::Result<()> {
+    async fn update_batches() -> eyre::Result<()> {
         crate::setup_tracing();
 
         use telegram::{GetUpdates, Update};
 
-        let (svc, mut controller) = mock::pair::<GetUpdates, Vec<Update>>();
-        let svc = svc.map_err(|e| e.to_string());
+        let (svc, mut controller) = mock::pair::<GetUpdates, Vec<Update<()>>>();
+        let svc = svc.map_err(|e| eyre!(e));
 
-        let mut batch_stream = UpdateBatchStream::new(svc);
+        let (send, mut recv) = mpsc::channel(100);
+        let mut task_handle = tokio::spawn(update_task(svc, send, |e| {
+            Err::<std::future::Ready<()>, _>(e)
+        }));
 
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Result<Vec<Update>, String>>(1);
-
-        // Forward all `batch_stream` elements to the channel on a separate task.
-        let stream_task = tokio::spawn(
-            batch_stream
-                .instrument(error_span!("in UpdateBatchStream"))
-                .map(Ok)
-                .forward(PollSender::new(sender).instrument(error_span!("sending to channel")))
-                .instrument(error_span!("in stream task")),
-        );
-
-        fn try_batch<'a>(
-            controller: &'a mut mock::Handle<GetUpdates, Vec<Update>>,
-            receiver: &'a mut sync::mpsc::Receiver<Result<Vec<Update>, String>>,
-            offset: Option<i64>,
-            updates: Result<Vec<telegram::Update>, String>,
-        ) -> impl Future<Output = eyre::Result<()>> + 'a {
-            let updates2 = updates.clone();
-            controller
-                .next_request()
-                .map(move |r| (r, offset))
-                .map(|(r, offset)| match r {
-                    Some((req, h)) => {
-                        ensure!(
-                            req.offset == offset,
-                            "expected offset {:?}, got {:?}",
-                            offset,
-                            req.offset
-                        );
-                        match updates {
-                            Ok(u) => h.send_response(u),
-                            Err(e) => h.send_error(e),
-                        }
-                        Ok(())
-                    }
-                    None => Err(eyre!("no request")),
-                })
-                .and_then(|()| {
-                    receiver
-                        .recv()
-                        .map(|r| r.ok_or_else(|| eyre!("sender dropped")))
-                })
-                .map(move |r| {
-                    let received = r?;
-                    ensure!(
-                        matches!(received.as_deref(), updates2),
-                        "received wrong update:\nexpected {updates2:?}\n\nreceived {received:?}"
-                    );
-                    Ok(())
-                })
+        async fn get_task_err(h: &mut JoinHandle<eyre::Result<()>>) -> eyre::Report {
+            match h.await {
+                Ok(Ok(())) => eyre!("task unexpectedly quit successfully"),
+                Ok(Err(e)) => e.wrap_err("update task failed unexpectedly"),
+                Err(e) => eyre!("task join error: {e:?}"),
+            }
         }
 
-        try_batch(
-            &mut controller,
-            &mut receiver,
-            None,
-            Ok(vec![telegram::Update {
-                update_id: 2,
-                message: None,
-            }]),
-        )
-        .await?;
+        select! {
+            biased;
+            e = get_task_err(&mut task_handle) => Err(e),
+            Some((req, handle)) = controller.next_request() => {
+                eyre::ensure!(req.offset.is_none(), "{:?}", req.offset);
+                handle.send_response(vec![telegram::Update {
+                    update_id: 123,
+                    detail: None,
+                }]);
 
-        std::assert_matches::assert_matches!(futures::poll!(stream_task), std::task::Poll::Pending);
+                let resp = recv.recv().then(or_pending).await;
+                ensure!(matches!(resp, telegram::Update { update_id: 123, detail: None}), "incorrect response");
 
-        try_batch(
-            &mut controller,
-            &mut receiver,
-            None,
-            Ok(vec![telegram::Update {
-                update_id: 2,
-                message: None,
-            }]),
-        )
-        .await?;
+                Ok(())
+            },
+            else => unreachable!(),
+        }?;
+
+        select! {
+            biased;
+            e = get_task_err(&mut task_handle) => Err(e),
+            Some((req, handle)) = controller.next_request() => {
+                eyre::ensure!(req.offset == Some(124), "{:?}", req.offset);
+                handle.send_response(vec![telegram::Update {
+                    update_id: 125,
+                    detail: Some(()),
+                }]);
+
+                let resp = recv.recv().then(or_pending).await;
+                ensure!(matches!(resp, telegram::Update { update_id: 125, detail: Some(())}), "incorrect response: {resp:?}");
+
+                Ok(())
+            },
+            else => unreachable!(),
+        }?;
+
+        select! {
+            biased;
+            e = get_task_err(&mut task_handle) => Err(e),
+            Some((req, handle)) = controller.next_request() => {
+                eyre::ensure!(req.offset == Some(126), "{:?}", req.offset);
+                handle.send_response(vec![telegram::Update {
+                    update_id: 127,
+                    detail: Some(()),
+                }, telegram::Update {
+                    update_id: 128,
+                    detail: None,
+                }]);
+
+                let resp = recv.recv().then(or_pending).await;
+                ensure!(matches!(resp, telegram::Update { update_id: 127, detail: Some(())}), "incorrect response: {resp:?}");
+
+                let resp = recv.recv().then(or_pending).await;
+                ensure!(matches!(resp, telegram::Update { update_id: 128, detail: None}), "incorrect response: {resp:?}");
+
+                Ok(())
+            },
+            else => unreachable!(),
+        }?;
+
+        let (req, handle) = controller.next_request().await.unwrap();
+        eyre::ensure!(req.offset == Some(129), "{:?}", req.offset);
+        handle.send_error("foo bar");
+        // Our error test handler fn should cause the task to quit
+        // immediately.
+        let err_string = task_handle
+            .await?
+            .err()
+            .ok_or_else(|| eyre!("task was successful?"))?
+            .to_string();
+        ensure!(err_string == "foo bar", "{err_string}");
 
         Ok(())
     }
+
+    // #[tokio::test]
+    // async fn update_task_obeys_err_fn() -> eyre::Result<()> {
+    //     crate::setup_tracing();
+
+    //     use std::sync::atomic::{AtomicU32, AtomicBool};
+    //     use std::sync::Arc;
+
+    //     use telegram::{GetUpdates, Update};
+
+    //     let (svc, mut controller) = mock::pair::<GetUpdates, Vec<Update<()>>>();
+    //     let svc = svc.map_err(|e| eyre!(e));
+
+    //     let err_count = Arc::new(AtomicU32::new(0));
+    //     let return_error = Arc::new()
+
+    //     let (send, mut recv) = mpsc::channel(100);
+    //     let mut task_handle = tokio::spawn(update_task(svc, send, |e| {
+    //         Err::<std::future::Ready<()>, _>(e)
+    //     }));
 }

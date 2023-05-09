@@ -5,6 +5,8 @@ use crate::http_service::{Body, FormPart, Method, Request, Url};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::ready;
+use pin_project::pin_project;
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -75,7 +77,7 @@ impl Bot {
 
     /// Given a service we can send HTTP requests on, construct the service to
     /// send Telegram queries. `client` should be cheaply cloneable (e.g.
-    /// reqwest::Client), which is a simple `Arc<_>` internally.
+    /// reqwest::Client, which is a simple `Arc<_>` internally).
     ///
     /// The returned value implements both `Client`, to send any Telegram query,
     /// and `tower::Service<Q>` for all query types `Q`, for interop with tower.
@@ -120,31 +122,11 @@ where
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        <&Self as Service<Q>>::poll_ready(&mut &*self, cx)
+        self.client.poll_ready(cx).map_err(Into::into)
     }
 
     fn call(&mut self, query: Q) -> Self::Future {
-        <&Self as Service<Q>>::call(&mut &*self, query)
-    }
-}
-
-impl<'a, Q: Query, S> Service<Q> for &'a Instance<S>
-where
-    S: Service<Request, Response = Bytes> + Clone,
-{
-    type Response = Q::Response;
-    type Error = ApiError<S::Error>;
-    type Future = DoCall<S, Q::Response>;
-
-    fn poll_ready(
-        &mut self,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, query: Q) -> Self::Future {
-        (*self).call(query)
+        build_call(self.client.clone(), query, (*self.url).clone())
     }
 }
 
@@ -187,7 +169,9 @@ fn build_call<Q: Query, S: Service<Request, Response = Bytes>>(
     }
 }
 
+#[pin_project]
 pub struct DoCall<S: Service<Request>, Resp> {
+    #[pin]
     fut: tracing::instrument::Instrumented<tower::util::Oneshot<S, Request>>,
     _phantom: std::marker::PhantomData<Resp>,
 }
@@ -200,15 +184,15 @@ where
     type Output = Result<Resp, ApiError<S::Error>>;
 
     fn poll(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         use std::task::Poll::*;
-        let bytes: Bytes = match unsafe { self.as_mut().map_unchecked_mut(|s| &mut s.fut) }.poll(cx)
-        {
-            Ready(Ok(b)) => b,
-            Ready(Err(e)) => return Ready(Err(e.into())),
-            Pending => return Pending,
+
+        let this = self.project();
+        let bytes: Bytes = match ready!(this.fut.poll(cx)) {
+            Ok(b) => b,
+            Err(e) => return Ready(Err(e.into())),
         };
 
         let resp: Result<Resp, _> = serde_json::from_slice(&bytes)
@@ -224,20 +208,34 @@ where
 #[derive(Deserialize)]
 pub struct Empty(IgnoredAny);
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct Update {
+/// <https://core.telegram.org/bots/api#update>
+///
+/// The API docs specify each update has at most one update variant, so the
+/// inner update is an `enum`.
+///
+/// `Update` is parametrized on `Detail` so tests don't have to worry about the
+/// update contents.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Update<Detail = UpdateDetail> {
     pub update_id: i64,
-    pub message: Option<Message>,
+    #[serde(flatten)]
+    pub detail: Option<Detail>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateDetail {
+    Message(Message),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Message {
     pub message_id: i64,
     pub text: Option<String>,
     pub chat: Chat,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Chat {
     pub id: i64,
 }
@@ -369,7 +367,9 @@ impl<T> Reply<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use eyre::*;
+    use serde_json::{json, Value};
     use tower::ServiceExt;
     use tower_test::*;
 
@@ -377,7 +377,7 @@ mod tests {
     use crate::test_util::*;
 
     #[tokio::test]
-    async fn test() -> eyre::Result<()> {
+    async fn test_api() -> eyre::Result<()> {
         crate::setup_tracing();
 
         let api = Bot::new("fake");
@@ -393,7 +393,6 @@ mod tests {
         );
         let Body::Normal(bytes) = req.body else { bail!("incorrect body type: {:?}", req.body)};
 
-        use serde_json::{json, Value};
         let value: Value = serde_json::from_slice(&bytes)?;
         ensure!(value == json!(null), "incorrect body: {value:?}");
         h.send_response(
@@ -419,6 +418,64 @@ mod tests {
             ),
             "service did not reply correctly"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize_update() -> eyre::Result<()> {
+        crate::setup_tracing();
+
+        let update: Update = serde_json::from_value(json!({
+            "update_id": 123,
+        }))?;
+
+        ensure!(
+            matches!(
+                update,
+                Update {
+                    update_id: 123,
+                    detail: None,
+                }
+            ),
+            "{update:?}"
+        );
+
+        let update: Update = serde_json::from_value(json!({
+            "update_id": 124,
+            "unrecognized_variant": {"foo": 42},
+        }))?;
+
+        ensure!(
+            matches!(
+                update,
+                Update {
+                    update_id: 124,
+                    detail: None,
+                }
+            ),
+            "{update:?}"
+        );
+
+        let update: Update = serde_json::from_value(json!({
+            "update_id": 124,
+            "message": {"message_id": 42, "text": "hello world", "chat": { "id": 1}},
+        }))?;
+
+        ensure!(
+            matches!(
+                update,
+                Update {
+                    update_id: 124,
+                    detail: Some(UpdateDetail::Message(Message {
+                        message_id: 42,
+                        text: Some(_),
+                        chat: Chat { id: 1 },
+                    })),
+                }
+            ),
+            "{update:?}"
+        );
+
         Ok(())
     }
 }
