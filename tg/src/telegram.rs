@@ -365,17 +365,18 @@ impl<T> Reply<T> {
 mod tests {
     use super::*;
 
+    use test_util::*;
+
     use eyre::*;
     use serde_json::{json, Value};
     use tower::ServiceExt;
     use tower_test::*;
 
     use crate::http_service as hs;
-    use crate::test_util::*;
 
     #[tokio::test]
     async fn test_api() -> eyre::Result<()> {
-        crate::setup_tracing();
+        setup_tracing_for_test();
 
         let api = Bot::new("fake");
         let (m, mut handle) = mock::pair::<hs::Request, Bytes>();
@@ -426,7 +427,7 @@ mod tests {
 
     #[test]
     fn deserialize_update() -> eyre::Result<()> {
-        crate::setup_tracing();
+        setup_tracing_for_test();
 
         let update: Update = serde_json::from_value(json!({
             "update_id": 123,

@@ -1,0 +1,33 @@
+[package]
+name = "tg-lib"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bytes.workspace = true
+futures.workspace = true
+http.workspace = true
+pin-project.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_urlencoded.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dependencies.reqwest]
+workspace = true
+features = ["multipart"]
+
+[dependencies.tower]
+workspace = true
+features = ["util"]
+
+[dev-dependencies]
+test-util = {path = "../test-util"}
+
+eyre.workspace = true
+tower-test.workspace = true
+
+[dev-dependencies.tokio]
+workspace = true
+features = ["rt", "macros"]

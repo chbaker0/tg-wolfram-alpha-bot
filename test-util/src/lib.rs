@@ -12,3 +12,18 @@ pub fn or_pending<T>(
         None => futures::future::Either::Right(std::future::pending()),
     }
 }
+
+pub fn setup_tracing_for_test() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+
+    ONCE.call_once(|| {
+        color_eyre::install().unwrap();
+
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        tracing_subscriber::fmt::fmt()
+            .finish()
+            .with(tracing_error::ErrorLayer::default())
+            .init();
+    });
+}

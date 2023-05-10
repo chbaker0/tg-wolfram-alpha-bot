@@ -1,9 +1,10 @@
 #![feature(assert_matches)]
 #![feature(never_type)]
 
-mod http_service;
-mod telegram;
 mod wolfram;
+
+use tg_lib::http_service;
+use tg_lib::telegram;
 
 use futures::Future;
 use telegram::Client;
@@ -208,13 +209,10 @@ static TELEGRAM_KEY: &str = include_str!("../.keys/telegram");
 static WOLFRAM_KEY: &str = include_str!("../.keys/wolframalpha");
 
 #[cfg(test)]
-mod test_util;
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
-    use crate::test_util::*;
+    use test_util::*;
 
     use eyre::{ensure, eyre};
 
