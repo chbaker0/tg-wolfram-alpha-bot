@@ -9,6 +9,8 @@ use tg_lib::telegram;
 use futures::Future;
 use telegram::Client;
 
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use eyre::WrapErr;
@@ -48,30 +50,32 @@ async fn main() -> eyre::Result<()> {
     println!("ID: {}", me.id);
     eyre::ensure!(me.is_bot, "we're not a bot?");
 
-    let (sender, mut receiver) = mpsc::channel(100);
-
+    /// Given a telegram API error, decides whether to retry (after resolving the
+    /// future) or quit and propagate the error.
     const MAX_API_ERRORS: u32 = 3;
-    let mut err_count = 0;
-    let tg_update_task = tokio::task::spawn(update_task(
-        tg.clone(),
-        sender,
-        move |err: telegram::ApiError<_>| {
+    let err_count = Arc::new(AtomicU32::new(0));
+    let handle_telegram_error = move |err: telegram::ApiError<_>| {
+        let err_count = err_count.clone();
+        async move {
             use telegram::ApiError::*;
             let wait_dur = match err {
                 RetryAfter(dur) => dur,
                 e => {
-                    if err_count == MAX_API_ERRORS {
+                    if err_count.fetch_add(1, Ordering::SeqCst) == MAX_API_ERRORS {
                         return Err(e);
                     }
 
-                    err_count += 1;
                     std::time::Duration::from_secs(5)
                 }
             };
 
-            Ok(tokio::time::sleep(wait_dur))
-        },
-    ));
+            tokio::time::sleep(wait_dur).await;
+            Ok(())
+        }
+    };
+
+    let (sender, mut receiver) = mpsc::channel(100);
+    let tg_update_task = tokio::task::spawn(update_task(tg.clone(), sender, handle_telegram_error));
 
     while let Some(u) = receiver.recv().await {
         let Some(telegram::UpdateDetail::Message(msg)) = u.detail else {continue};
@@ -162,17 +166,17 @@ where
 /// the API returns an error, `inspect_err` is called. If `Ok(fut)`, the
 /// returned future is awaited (e.g. to allow retrying after some time) then the
 /// task continues. Otherwise, the task quits with the returned error.
-async fn update_task<T, S, EFn, ContFut, E1, E2>(
+async fn update_task<T, S, EFn, ContFut>(
     mut svc: S,
     chan: tokio::sync::mpsc::Sender<telegram::Update<T>>,
     mut inspect_err: EFn,
 ) -> eyre::Result<()>
 where
     T: std::fmt::Debug,
-    S: Service<telegram::GetUpdates, Response = Vec<telegram::Update<T>>, Error = E1>,
-    EFn: FnMut(E1) -> Result<ContFut, E2>,
-    ContFut: Future<Output = ()>,
-    E2: std::error::Error + Send + Sync + 'static,
+    S: Service<telegram::GetUpdates, Response = Vec<telegram::Update<T>>>,
+    S::Error: std::error::Error + Send + Sync + 'static,
+    EFn: FnMut(S::Error) -> ContFut,
+    ContFut: Future<Output = Result<(), S::Error>>,
 {
     let timeout = 30;
     let mut cur_offset = None;
@@ -188,12 +192,17 @@ where
         {
             Ok(b) => b,
             Err(e) => {
-                inspect_err(e)?.await;
+                inspect_err(e).await?;
                 continue;
             }
         };
 
         cur_offset = batch.iter().map(|u| u.update_id + 1).max().or(cur_offset);
+
+        // Poll the channel in case the batch is empty, so we can close early.
+        if chan.is_closed() {
+            return Ok(());
+        }
 
         for u in batch {
             tracing::info!("{cur_offset:?} {u:?}");
@@ -219,6 +228,7 @@ mod tests {
     use futures::FutureExt;
     use tokio::select;
 
+    use tokio::sync::Mutex;
     use tokio::task::JoinHandle;
 
     use tower_test::*;
@@ -233,9 +243,7 @@ mod tests {
         let svc = svc.map_err(|e| EyreWrapper::from(eyre!(e)));
 
         let (send, mut recv) = mpsc::channel(100);
-        let mut task_handle = tokio::spawn(update_task(svc, send, |e| {
-            Err::<std::future::Ready<()>, _>(e)
-        }));
+        let mut task_handle = tokio::spawn(update_task(svc, send, |e| async move { Err(e) }));
 
         async fn get_task_err(h: &mut JoinHandle<eyre::Result<()>>) -> eyre::Report {
             match h.await {
@@ -320,23 +328,91 @@ mod tests {
         Ok(())
     }
 
-    // #[tokio::test]
-    // async fn update_task_obeys_err_fn() -> eyre::Result<()> {
-    //     crate::setup_tracing();
+    #[tokio::test]
+    async fn update_task_quits_gracefully() -> eyre::Result<()> {
+        crate::setup_tracing();
 
-    //     use std::sync::atomic::{AtomicU32, AtomicBool};
-    //     use std::sync::Arc;
+        use telegram::{GetUpdates, Update};
 
-    //     use telegram::{GetUpdates, Update};
+        let (svc, mut controller) = mock::pair::<GetUpdates, Vec<Update<()>>>();
+        let svc = svc.map_err(|_| EyreWrapper::from(eyre!("")));
 
-    //     let (svc, mut controller) = mock::pair::<GetUpdates, Vec<Update<()>>>();
-    //     let svc = svc.map_err(|e| eyre!(e));
+        let (send, mut recv) = mpsc::channel(100);
+        let task_handle = tokio::spawn(update_task(svc, send, |e| async move { Err(e) }));
 
-    //     let err_count = Arc::new(AtomicU32::new(0));
-    //     let return_error = Arc::new()
+        let (_, h) = controller.next_request().await.unwrap();
+        h.send_response(vec![]);
 
-    //     let (send, mut recv) = mpsc::channel(100);
-    //     let mut task_handle = tokio::spawn(update_task(svc, send, |e| {
-    //         Err::<std::future::Ready<()>, _>(e)
-    //     }));
+        let (_, h) = controller.next_request().await.unwrap();
+        h.send_response(vec![]);
+
+        let (_, h) = controller.next_request().await.unwrap();
+        recv.close();
+        h.send_response(vec![]);
+
+        task_handle.await?
+    }
+
+    #[tokio::test]
+    async fn update_task_obeys_err_fn() -> eyre::Result<()> {
+        crate::setup_tracing();
+
+        use std::sync::Arc;
+
+        use telegram::{GetUpdates, Update};
+
+        let (svc, mut controller) = mock::pair::<GetUpdates, Vec<Update<()>>>();
+        let svc = svc.map_err(|_| EyreWrapper::from(eyre!("")));
+
+        // Send/recv a bool to decide whether to quit in `handle_err`. One
+        // message per API error. Since the channel has length 1, each send
+        // will wait until the error is handled.
+        let (quit_send, quit_recv) = mpsc::channel(1);
+
+        let quit_recv = Arc::new(Mutex::new(quit_recv));
+        let handle_err = move |e| {
+            let quit_recv = quit_recv.clone();
+            async move {
+                let should_quit = quit_recv.lock().await.recv().await.unwrap();
+                if should_quit {
+                    Err(e)
+                } else {
+                    Ok(())
+                }
+            }
+        };
+
+        let (send, _recv) = mpsc::channel(100);
+        let task_handle = tokio::spawn(update_task(svc, send, handle_err));
+
+        let (_, h) = controller.next_request().await.unwrap();
+        h.send_response(vec![]);
+
+        let (_, h) = controller.next_request().await.unwrap();
+        h.send_error(eyre!(""));
+        quit_send.send(false).await?;
+
+        let (_, h) = controller.next_request().await.unwrap();
+        h.send_error(eyre!(""));
+        quit_send.send(false).await?;
+
+        let (_, h) = controller.next_request().await.unwrap();
+        h.send_response(vec![]);
+
+        let (_, h) = controller.next_request().await.unwrap();
+        h.send_error(eyre!(""));
+        quit_send.send(true).await?;
+
+        eyre::ensure!(
+            controller.next_request().await.is_none(),
+            "task did not quit"
+        );
+        let err = task_handle
+            .await?
+            .err()
+            .ok_or(eyre!("task did not return the error"))?;
+        eyre::ensure!(err.to_string() == "", "task returned wrong error?");
+
+        Ok(())
+    }
 }
